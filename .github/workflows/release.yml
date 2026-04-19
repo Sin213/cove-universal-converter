@@ -47,7 +47,9 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils tar xz-utils curl libfuse2
+          sudo apt-get install -y \
+            binutils tar xz-utils curl libfuse2 \
+            libcairo2-dev pkg-config
 
       - name: Run Linux build script
         run: |
