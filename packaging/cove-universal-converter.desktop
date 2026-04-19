@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Cove Universal Converter
+GenericName=File Format Converter
+Comment=Batch-convert video, audio, images, and documents offline
+Exec=cove-universal-converter
+Icon=cove-universal-converter
+Terminal=false
+Categories=AudioVideo;Video;Audio;Graphics;Office;Utility;
+Keywords=convert;video;audio;image;document;pdf;ffmpeg;pandoc;
+StartupNotify=true

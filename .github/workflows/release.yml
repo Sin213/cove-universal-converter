@@ -1,0 +1,120 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (no leading v)'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="${{ github.event.inputs.version }}"
+            [ -z "$v" ] && v="0.0.0-dev"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils tar xz-utils curl libfuse2
+
+      - name: Run Linux build script
+        run: |
+          chmod +x scripts/build-release.sh
+          bash scripts/build-release.sh
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: release/*.AppImage
+          if-no-files-found: error
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: release/*.deb
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.AppImage
+            release/*.deb
+          body_path: .github/RELEASE_NOTES_v${{ needs.resolve-version.outputs.version }}.md
+          fail_on_unmatched_files: true
+
+  build-windows:
+    needs: resolve-version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Windows build script
+        shell: pwsh
+        run: .\build.ps1 -Version $env:VERSION
+
+      - name: Upload Setup installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup
+          path: release/*-Setup.exe
+          if-no-files-found: error
+
+      - name: Upload Portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: release/*-Portable.exe
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*-Setup.exe
+            release/*-Portable.exe
+          body_path: .github/RELEASE_NOTES_v${{ needs.resolve-version.outputs.version }}.md
+          fail_on_unmatched_files: true
