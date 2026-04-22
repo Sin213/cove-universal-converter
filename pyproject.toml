@@ -1,6 +1,6 @@
 [project]
 name = "cove-universal-converter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline, privacy-first batch file converter (A/V, images, documents)."
 requires-python = ">=3.11"
 dependencies = [
