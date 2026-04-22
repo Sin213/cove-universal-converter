@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from cove_converter import __version__, updater
 from cove_converter.binaries import resource_path
 from cove_converter.engines import worker_for
 from cove_converter.routing import SUPPORTED_FORMATS, engine_for, info_for, targets_for
@@ -82,7 +83,7 @@ _TINT_NONE: QColor | None = None
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Cove Universal Converter")
+        self.setWindowTitle(f"Cove Universal Converter v{__version__}")
         self.resize(960, 640)
         self.setStyleSheet(_DARK_QSS)
 
@@ -137,6 +138,15 @@ class MainWindow(QMainWindow):
         self._build_action_row(layout)
 
         self.statusBar()  # create the implicit status bar
+
+        self._updater = updater.UpdateController(
+            parent=self,
+            current_version=__version__,
+            repo="Sin213/cove-universal-converter",
+            app_display_name="Cove Universal Converter",
+            cache_subdir="cove-universal-converter",
+        )
+        QTimer.singleShot(4000, self._updater.check)
 
     # =========================================================
     # Layout builders
