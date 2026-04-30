@@ -17,3 +17,12 @@ cove_icon.ico
 .vscode/
 .idea/
 .DS_Store
+
+# Local AI/audit scratch files
+.audit/
+codex-reviews/
+
+# Personal agent / workflow config
+CLAUDE.md
+WORKFLOW.md
+RELEASES.md
