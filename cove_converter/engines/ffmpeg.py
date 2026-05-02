@@ -44,6 +44,15 @@ _VIDEO_CODEC: dict[str, str] = {
 
 _LOSSLESS_AUDIO = {"pcm_s16le", "pcm_s16be", "flac"}
 
+# WebM defaults. VP9's CRF scale runs hotter than x264's: the near-lossless
+# x264 default (CRF 17) translates to roughly VP9 CRF 24 and bloats typical
+# web-source MP4s by 5-10x. Use VP9's recommended balanced default unless the
+# user opts into custom quality with the sliders. Opus is transparent well
+# below the 320 kbps near-lossless default we use for AAC/MP3, so cap it at a
+# sane bitrate too.
+_WEBM_DEFAULT_VP9_CRF   = 32
+_WEBM_DEFAULT_OPUS_KBPS = 128
+
 
 def _hhmmss_to_seconds(h: str, m: str, s: str) -> float:
     return int(h) * 3600 + int(m) * 60 + float(s)
@@ -85,14 +94,18 @@ class FFmpegWorker(BaseConverterWorker):
         # Video output — pair a sensible audio codec with the container.
         vcodec = _VIDEO_CODEC.get(out_ext, "libx264")
         acodec = "libopus" if out_ext == ".webm" else "aac"
-        crf = s.effective_video_crf()
         preset = s.effective_video_preset()
         cmd += ["-c:v", vcodec]
         if vcodec in ("libx264", "libx265"):
-            cmd += ["-crf", str(crf), "-preset", preset]
+            cmd += ["-crf", str(s.effective_video_crf()), "-preset", preset]
         elif vcodec == "libvpx-vp9":
-            cmd += ["-crf", str(crf), "-b:v", "0"]
-        cmd += ["-c:a", acodec, "-b:a", f"{abr}k"]
+            vp9_crf = s.video_crf if s.use_custom_quality else _WEBM_DEFAULT_VP9_CRF
+            cmd += ["-crf", str(vp9_crf), "-b:v", "0",
+                    "-row-mt", "1", "-pix_fmt", "yuv420p"]
+        if acodec == "libopus" and not s.use_custom_quality:
+            cmd += ["-c:a", "libopus", "-b:a", f"{_WEBM_DEFAULT_OPUS_KBPS}k"]
+        else:
+            cmd += ["-c:a", acodec, "-b:a", f"{abr}k"]
         cmd += [str(self.output_path)]
         return cmd
 
