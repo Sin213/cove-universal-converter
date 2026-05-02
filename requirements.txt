@@ -3,3 +3,5 @@ Pillow>=10.0
 pillow-heif>=0.18
 pypdf>=4.3
 xhtml2pdf>=0.2.16
+openpyxl>=3.1
+PyYAML>=6.0

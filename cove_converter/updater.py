@@ -25,6 +25,7 @@ Usage from a MainWindow:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -156,18 +157,71 @@ class UpdateCheckWorker(QObject):
         self.updateAvailable.emit(info)
 
 
+def _parse_sidecar(text: str, asset_name: str) -> str | None:
+    """Pull the SHA-256 hex digest for `asset_name` out of a sidecar body.
+
+    Accepts either the bare ``sha256sum <file>`` single-line form
+    (``<hex>  <name>``) or a multi-entry SHA256SUMS-style file. Returns the
+    lowercase 64-char hex digest, or None if no matching line is found."""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        digest = parts[0].lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            continue
+        if len(parts) == 1:
+            # Single-token sidecar — caller takes responsibility.
+            return digest
+        name_field = parts[1].lstrip("*").strip()
+        if name_field == asset_name or Path(name_field).name == asset_name:
+            return digest
+    return None
+
+
+def _fetch_sidecar(url: str, repo: str, timeout: float = 20.0) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"{repo.split('/')[-1]}-updater"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _hash_file(path: Path, chunk: int = 262144) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            block = f.read(chunk)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
 class DownloadWorker(QObject):
-    """Stream a URL to a destination file, emitting progress as a percentage."""
+    """Stream a URL to a destination file, emitting progress as a percentage.
+
+    Before signalling ``finished``, fetches ``<url>.sha256`` from the same
+    release and verifies the downloaded bytes match. A missing sidecar or
+    digest mismatch is treated as a hard failure: the partial file is
+    deleted and ``failed`` is emitted, so the swap/relaunch path is never
+    reached without an end-to-end checksum match.
+    """
 
     progress = Signal(int)           # 0–100
     finished = Signal(str)           # destination path
     failed = Signal(str)
 
-    def __init__(self, url: str, dest: Path, repo: str) -> None:
+    def __init__(self, url: str, dest: Path, repo: str, asset_name: str) -> None:
         super().__init__()
         self._url = url
         self._dest = dest
         self._repo = repo
+        self._asset_name = asset_name
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -194,6 +248,7 @@ class DownloadWorker(QObject):
                         written += len(chunk)
                         if total > 0:
                             self.progress.emit(int(written * 100 / total))
+            self._verify_checksum()
             self.finished.emit(str(self._dest))
         except Exception as exc:  # noqa: BLE001
             try:
@@ -201,6 +256,26 @@ class DownloadWorker(QObject):
             except Exception:  # noqa: BLE001
                 pass
             self.failed.emit(str(exc))
+
+    def _verify_checksum(self) -> None:
+        sidecar_url = f"{self._url}.sha256"
+        try:
+            body = _fetch_sidecar(sidecar_url, self._repo)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"checksum sidecar missing or unreachable ({sidecar_url}): {exc}"
+            ) from exc
+        expected = _parse_sidecar(body, self._asset_name)
+        if not expected:
+            raise RuntimeError(
+                f"no SHA-256 entry for {self._asset_name!r} in sidecar at {sidecar_url}"
+            )
+        actual = _hash_file(self._dest)
+        if actual != expected:
+            raise RuntimeError(
+                f"checksum mismatch for {self._asset_name}: "
+                f"expected {expected}, got {actual}"
+            )
 
 
 def swap_in_appimage(new_path: Path) -> Path:
@@ -332,7 +407,7 @@ class UpdateController(QObject):
         self._progress.setValue(0)
 
         thread = QThread(self)
-        worker = DownloadWorker(info.asset_url, dest, self._repo)
+        worker = DownloadWorker(info.asset_url, dest, self._repo, info.asset_name)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(thread.quit)

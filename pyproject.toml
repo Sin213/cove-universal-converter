@@ -1,6 +1,6 @@
 [project]
 name = "cove-universal-converter"
-version = "0.2.0"
+version = "2.0.0"
 description = "Offline, privacy-first batch file converter (A/V, images, documents)."
 requires-python = ">=3.11"
 dependencies = [
@@ -9,6 +9,8 @@ dependencies = [
     "pillow-heif>=0.18",
     "pypdf>=4.3",
     "xhtml2pdf>=0.2.16",
+    "openpyxl>=3.1",
+    "PyYAML>=6.0",
 ]
 
 [project.scripts]

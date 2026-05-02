@@ -19,11 +19,22 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = "1.0.0"
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# Single source of truth: pyproject.toml. Pass -Version to override.
+if (-not $Version) {
+    $pyproject = Join-Path $PSScriptRoot 'pyproject.toml'
+    if (Test-Path $pyproject) {
+        $match = Select-String -Path $pyproject -Pattern '^version\s*=\s*"([^"]+)"' |
+                 Select-Object -First 1
+        if ($match) { $Version = $match.Matches[0].Groups[1].Value }
+    }
+    if (-not $Version) { $Version = '1.0.0' }
+}
 
 $App         = "cove-universal-converter"
 $ReleaseDir  = "release"
@@ -38,6 +49,16 @@ function Download-File([string]$url, [string]$dest) {
     if ($LASTEXITCODE -ne 0) { throw "Download failed: $url" }
 }
 
+function Write-Sha256Sidecar([string]$file) {
+    # Match Linux `sha256sum <file>` output exactly: lowercase hex, two spaces,
+    # bare relative filename. Same format the updater's _parse_sidecar accepts.
+    if (-not (Test-Path $file)) { throw "Sidecar source missing: $file" }
+    $hash = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLower()
+    $name = [System.IO.Path]::GetFileName($file)
+    $line = "{0}  {1}`n" -f $hash, $name
+    [System.IO.File]::WriteAllText("$file.sha256", $line, [System.Text.UTF8Encoding]::new($false))
+}
+
 Step "Building $App v$Version"
 
 # --- 1. Build environment ----------------------------------------------------
@@ -45,8 +66,9 @@ Step "[1/8] Creating build venv"
 if (Test-Path .buildenv) { Remove-Item -Recurse -Force .buildenv }
 python -m venv .buildenv
 & .\.buildenv\Scripts\python.exe -m pip install --quiet --upgrade pip
-& .\.buildenv\Scripts\python.exe -m pip install --quiet `
-    PySide6 Pillow pillow-heif pypdf xhtml2pdf pyinstaller
+# Install runtime deps from requirements.txt (single source of truth) plus
+# pyinstaller for the build itself.
+& .\.buildenv\Scripts\python.exe -m pip install --quiet -r requirements.txt pyinstaller
 
 # --- 2. Generate .ico from the PNG ------------------------------------------
 Step "[2/8] Generating cove_icon.ico"
@@ -102,6 +124,8 @@ $commonArgs = @(
     '--hidden-import', 'reportlab',
     '--hidden-import', 'pillow_heif',
     '--hidden-import', 'pypdf',
+    '--hidden-import', 'openpyxl',
+    '--hidden-import', 'yaml',
     '--exclude-module', 'PySide6.QtWebEngineCore',
     '--exclude-module', 'PySide6.QtWebEngineWidgets',
     '--exclude-module', 'PySide6.QtQml',
@@ -141,6 +165,8 @@ $portableName = "$App-portable"
     --hidden-import reportlab `
     --hidden-import pillow_heif `
     --hidden-import pypdf `
+    --hidden-import openpyxl `
+    --hidden-import yaml `
     --exclude-module PySide6.QtWebEngineCore `
     --exclude-module PySide6.QtWebEngineWidgets `
     --exclude-module PySide6.QtQml `
@@ -191,6 +217,16 @@ $portableSrc  = Join-Path 'dist' "$portableName.exe"
 $portableDest = Join-Path $ReleaseDir ("{0}-{1}-Portable.exe" -f $App, $Version)
 if (Test-Path $portableDest) { Remove-Item -Force $portableDest }
 Copy-Item $portableSrc $portableDest -Force
+
+Step "Writing SHA-256 sidecars"
+# Cove Nexus mandates `<asset>.sha256` sidecars next to every shipped binary
+# so the in-app updater's checksum verification path can succeed on Windows.
+$setupDest = Join-Path $ReleaseDir ("{0}-{1}-Setup.exe" -f $App, $Version)
+if (-not (Test-Path $setupDest)) {
+    throw "Expected Inno Setup output not found: $setupDest"
+}
+Write-Sha256Sidecar $setupDest
+Write-Sha256Sidecar $portableDest
 
 # --- 8. Cleanup --------------------------------------------------------------
 Step "[8/8] Cleaning up"
