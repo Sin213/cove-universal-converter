@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cove_converter.routing import effective_stem
+
 
 @dataclass
 class FileRow:
@@ -14,13 +16,18 @@ class FileRow:
     # If set, overrides the computed path (used when the user chose to
     # rename duplicates in the overwrite-confirm dialog).
     override_output: Path | None = None
+    # Path the worker actually wrote to. Captured on success so later
+    # open/show actions don't recompute against a now-changed output dir.
+    completed_output: Path | None = None
 
     def resolve_output(self, dest_dir: Path | None) -> Path:
         if self.override_output is not None:
             return self.override_output
-        if dest_dir is None:
-            return self.path.with_suffix(self.target_ext)
-        return dest_dir / (self.path.stem + self.target_ext)
+        # ``effective_stem`` strips compound suffixes like ``.tar.gz`` so the
+        # rebuilt name doesn't end up as ``foo.tar.zip``.
+        stem = effective_stem(self.path)
+        parent = self.path.parent if dest_dir is None else dest_dir
+        return parent / (stem + self.target_ext)
 
 
 def unique_path(path: Path, reserved: set[Path] | None = None) -> Path:

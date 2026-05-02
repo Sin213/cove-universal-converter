@@ -14,6 +14,9 @@ release/
 cove_icon.ico
 .buildenv/
 
+# Local source bundle produced by packaging scripts
+cove_converter.zip
+
 .vscode/
 .idea/
 .DS_Store
