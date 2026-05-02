@@ -46,12 +46,13 @@ _LOSSLESS_AUDIO = {"pcm_s16le", "pcm_s16be", "flac"}
 
 # WebM defaults. VP9's CRF scale runs hotter than x264's: the near-lossless
 # x264 default (CRF 17) translates to roughly VP9 CRF 24 and bloats typical
-# web-source MP4s by 5-10x. Use VP9's recommended balanced default unless the
-# user opts into custom quality with the sliders. Opus is transparent well
-# below the 320 kbps near-lossless default we use for AAC/MP3, so cap it at a
-# sane bitrate too.
-_WEBM_DEFAULT_VP9_CRF   = 32
-_WEBM_DEFAULT_OPUS_KBPS = 128
+# web-source MP4s by 5-10x. CRF 32 still inflates 1080p sources (~1.5x on an
+# AV1-encoded MP4 in our smoke). Use a size-aware balanced default and let the
+# user opt into custom quality with the sliders for higher fidelity. Opus is
+# transparent well below 128 kbps for typical content, so default lower too.
+_WEBM_DEFAULT_VP9_CRF   = 36
+_WEBM_DEFAULT_OPUS_KBPS = 96
+_WEBM_DEFAULT_CPU_USED  = "4"
 
 
 def _hhmmss_to_seconds(h: str, m: str, s: str) -> float:
@@ -102,6 +103,10 @@ class FFmpegWorker(BaseConverterWorker):
             vp9_crf = s.video_crf if s.use_custom_quality else _WEBM_DEFAULT_VP9_CRF
             cmd += ["-crf", str(vp9_crf), "-b:v", "0",
                     "-row-mt", "1", "-pix_fmt", "yuv420p"]
+            if not s.use_custom_quality:
+                # Default path: keep encode time sane and avoid the
+                # near-lossless "best" deadline that bloats output.
+                cmd += ["-deadline", "good", "-cpu-used", _WEBM_DEFAULT_CPU_USED]
         if acodec == "libopus" and not s.use_custom_quality:
             cmd += ["-c:a", "libopus", "-b:a", f"{_WEBM_DEFAULT_OPUS_KBPS}k"]
         else:
