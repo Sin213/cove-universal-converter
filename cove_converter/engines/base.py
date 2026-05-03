@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -45,6 +47,52 @@ def _allocate_temp_output(final: Path) -> Path:
         suffix=suffix,
         dir=str(final.parent),
     )
+    os.close(fd)
+    tmp = Path(tmp_str)
+    # ``mkstemp`` creates at 0o600 on POSIX, but some filesystems (notably
+    # NTFS-3G / exFAT external mounts under /run/media) report a more
+    # restrictive mode driven by the mount's ``fmask``/``umask``, which can
+    # leave the temp read-only even though we just created it. Try a chmod
+    # to restore owner write — if the FS ignores it, the writability probe
+    # in ``BaseConverterWorker.run`` will catch it and fall back to a
+    # system-temp output. The final mode is normalised post-replace by
+    # ``_normalize_output_mode``.
+    if sys.platform != "win32":
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+    return tmp
+
+
+def _verify_writable(path: Path) -> bool:
+    """Confirm ``path`` can actually be reopened for writing.
+
+    On NTFS-3G / exFAT mounts a freshly-``mkstemp``-ed file can be reported
+    with a mount-enforced mode that forbids write even for the creating
+    user, and ``os.chmod`` may silently no-op on those mounts. The only
+    reliable signal is to actually open the path with write intent. We use
+    ``r+b`` so the probe does not truncate or otherwise mutate a file that
+    may already contain content (mkstemp leaves it empty, but this helper
+    is generic).
+    """
+    try:
+        with open(path, "r+b"):
+            pass
+    except OSError:
+        return False
+    return True
+
+
+def _allocate_fallback_temp(suffix: str) -> Path:
+    """Allocate a temp file in the system temp directory.
+
+    Used only when ``_allocate_temp_output`` produced a sibling temp on the
+    destination filesystem that turned out to be non-writable. The system
+    temp dir is virtually always a normal POSIX filesystem (``tmpfs`` /
+    ext4 / APFS / NTFS local), so a freshly-``mkstemp``-ed file is reliably
+    writable for the current user."""
+    fd, tmp_str = tempfile.mkstemp(prefix=".cove-part-", suffix=suffix)
     os.close(fd)
     return Path(tmp_str)
 
@@ -105,6 +153,10 @@ class BaseConverterWorker(QThread):
         # callers that introspect it pre-run still see something sensible.
         self.output_path = self._final_output_path
         self._owned_temp_path: Path | None = None
+        # Staging path used only on the cross-filesystem (EXDEV) finalisation
+        # path. Tracked so cleanup on failure/cancel can remove it without
+        # touching ``self._final_output_path``.
+        self._owned_staging_path: Path | None = None
         self.settings = settings or default_settings()
         self._cancel = False
 
@@ -126,13 +178,116 @@ class BaseConverterWorker(QThread):
             # only file the worker is allowed to delete on cancel/failure.
             temp = _allocate_temp_output(final)
             self._owned_temp_path = temp
+            # Probe the sibling temp for actual write capability. On NTFS-3G
+            # / exFAT mounts the file can come back read-only despite our
+            # chmod, in which case opening it for write later (PIL, ffmpeg,
+            # pandoc, etc.) would fail with PermissionError mid-conversion.
+            # Fall back to the system temp dir, which is virtually always a
+            # normal POSIX filesystem.
+            if not _verify_writable(temp):
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+                self._owned_temp_path = None
+                fallback = _allocate_fallback_temp(final.suffix)
+                if not _verify_writable(fallback):
+                    try:
+                        fallback.unlink()
+                    except OSError:
+                        pass
+                    raise RuntimeError(
+                        "Could not allocate a writable temp file for conversion"
+                    )
+                temp = fallback
+                self._owned_temp_path = temp
             self.output_path = temp
             self._convert()
             if self._cancel:
                 self._cleanup_temp()
                 self.status.emit("Cancelled")
                 return
-            os.replace(str(temp), str(final))
+            try:
+                os.replace(str(temp), str(final))
+            except OSError as exc:
+                # Cross-filesystem rename (sibling fallback was redirected to
+                # /tmp). ``os.rename`` returns EXDEV on POSIX in this case;
+                # we have to physically copy. Crucially, never copy *over*
+                # ``final`` — a mid-copy failure would truncate or partially
+                # overwrite an existing destination, which is data loss.
+                # Stage into a hidden sibling of ``final`` first, then atomic
+                # intra-fs ``os.replace`` swaps it in. If anything goes wrong
+                # before the swap, the pre-existing ``final`` is untouched.
+                if exc.errno != errno.EXDEV:
+                    raise
+                # Cap the embedded ``final.name`` so the staging filename
+                # stays under common NAME_MAX (255 bytes).
+                embedded = final.name
+                embedded_bytes = embedded.encode("utf-8")
+                max_embedded = 200
+                if len(embedded_bytes) > max_embedded:
+                    embedded = (
+                        embedded_bytes[:max_embedded].decode("utf-8", errors="ignore")
+                        or "out"
+                    )
+                fd, staging_str = tempfile.mkstemp(
+                    prefix=f".{embedded}.cove-final-",
+                    suffix=".tmp",
+                    dir=str(final.parent),
+                )
+                staging = Path(staging_str)
+                self._owned_staging_path = staging
+                # Write through the fd ``mkstemp`` already gave us — never
+                # reopen the staging path for writing. On NTFS-3G / exFAT
+                # external mounts the path can be unreopen-able for write
+                # even though the create-time fd is writable, which is the
+                # exact failure mode that drove the sibling-temp fallback in
+                # the first place. ``shutil.copyfile`` would re-trip it by
+                # opening the destination path for write internally; routing
+                # the bytes through ``os.fdopen(fd, "wb")`` keeps us on the
+                # original fd that mkstemp already proved writable.
+                try:
+                    with os.fdopen(fd, "wb") as staging_file, \
+                            open(str(temp), "rb") as src_file:
+                        shutil.copyfileobj(src_file, staging_file)
+                        staging_file.flush()
+                        os.fsync(staging_file.fileno())
+                except Exception:
+                    # Copy faulted (disk full, source unreadable, etc).
+                    # ``with`` already closed the staging fd. ``final`` was
+                    # never touched — only ``staging`` was written to.
+                    try:
+                        staging.unlink()
+                    except (FileNotFoundError, OSError):
+                        pass
+                    self._owned_staging_path = None
+                    raise
+                if sys.platform != "win32":
+                    try:
+                        os.chmod(staging, 0o600)
+                    except OSError:
+                        pass
+                try:
+                    os.replace(str(staging), str(final))
+                except Exception:
+                    # Intra-fs rename failed after a successful copy. ``final``
+                    # is still byte-for-byte its prior content — ``os.replace``
+                    # is atomic on POSIX, so a failure here means the swap
+                    # never happened.
+                    try:
+                        staging.unlink()
+                    except (FileNotFoundError, OSError):
+                        pass
+                    self._owned_staging_path = None
+                    raise
+                # On success ``staging`` no longer exists — it was renamed
+                # over ``final``. Drop the ownership slot and remove the
+                # cross-fs source temp.
+                self._owned_staging_path = None
+                try:
+                    os.unlink(str(temp))
+                except OSError:
+                    pass
             self._owned_temp_path = None
             self.output_path = final
             _normalize_output_mode(final, prior_mode)
@@ -157,19 +312,22 @@ class BaseConverterWorker(QThread):
             self.failed.emit(str(exc))
 
     def _cleanup_temp(self) -> None:
-        # Only ever unlink the path we created in this run. Never touch a
-        # file we didn't allocate ourselves — even if a sibling happens to
-        # share the old deterministic name.
-        owned = self._owned_temp_path
-        if owned is None:
-            return
-        try:
-            owned.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
-        self._owned_temp_path = None
+        # Only ever unlink paths we created in this run. Never touch a file
+        # we didn't allocate ourselves — even if a sibling happens to share
+        # the old deterministic name. Staging is unlinked first because it
+        # lives in the destination directory and is the more sensitive of
+        # the two; the system-temp fallback comes after.
+        for attr in ("_owned_staging_path", "_owned_temp_path"):
+            owned: Path | None = getattr(self, attr, None)
+            if owned is None:
+                continue
+            try:
+                owned.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            setattr(self, attr, None)
 
     def _convert(self) -> None:
         raise NotImplementedError
