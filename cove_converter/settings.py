@@ -39,6 +39,11 @@ class ConversionSettings:
     # Batch concurrency is independent of the quality toggle.
     max_concurrent: int = 3
 
+    # PDF-specific. Off by default — Cove apps must never auto-degrade user
+    # files. Only honoured by the pdf→pdf branch in PdfWorker.
+    enhance_scanned_pdf: bool = False
+    pdf_enhance_dpi: int = 200          # internal; not exposed in UI v1
+
     def effective_video_crf(self) -> int:
         return self.video_crf if self.use_custom_quality else _DEFAULT_VIDEO_CRF
 

@@ -34,10 +34,10 @@ _DOC_TARGETS   = (".pdf", ".docx", ".md", ".html", ".epub", ".txt", ".rtf", ".od
 
 SUPPORTED_FORMATS: dict[str, FormatInfo] = {
     # ---- Images ----
-    ".png":  FormatInfo("Pillow", (".jpg", ".webp", ".bmp", ".tiff", ".ico")),
-    ".jpg":  FormatInfo("Pillow", (".png", ".webp", ".bmp", ".tiff")),
-    ".jpeg": FormatInfo("Pillow", (".png", ".webp", ".bmp", ".tiff")),
-    ".webp": FormatInfo("Pillow", (".jpg", ".png", ".bmp", ".tiff")),
+    ".png":  FormatInfo("Pillow", (".jpg", ".webp", ".bmp", ".tiff", ".ico", ".pdf")),
+    ".jpg":  FormatInfo("Pillow", (".png", ".webp", ".bmp", ".tiff", ".pdf")),
+    ".jpeg": FormatInfo("Pillow", (".png", ".webp", ".bmp", ".tiff", ".pdf")),
+    ".webp": FormatInfo("Pillow", (".jpg", ".png", ".bmp", ".tiff", ".pdf")),
     ".bmp":  FormatInfo("Pillow", (".jpg", ".png", ".webp", ".tiff")),
     ".tiff": FormatInfo("Pillow", (".jpg", ".png", ".webp", ".bmp")),
     ".tif":  FormatInfo("Pillow", (".jpg", ".png", ".webp", ".bmp")),
