@@ -65,7 +65,13 @@ from cove_converter.ui.drop_zone import DropZone
 from cove_converter.ui.file_row import FileRow, unique_path
 from cove_converter.ui.formats_dialog import FormatsDialog
 from cove_converter.ui.quality_dialog import QualityDialog
-from cove_converter.ui.theme import BORDER_STRONG, SURFACE_2, category_for
+from cove_converter.ui.theme import (
+    category_for,
+    current_theme,
+    register_theme_listener,
+    theme_color,
+    toggle_theme,
+)
 
 
 _COL_FILE, _COL_TARGET, _COL_PROGRESS, _COL_STATUS = range(4)
@@ -116,6 +122,18 @@ _SVG_FILE = b"""<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill
  stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'>
  <path d='M14 3v4a1 1 0 0 0 1 1h4'/>
  <path d='M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2Z'/></svg>"""
+
+_SVG_SUN = b"""<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'
+ stroke='currentColor' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'>
+ <circle cx='12' cy='12' r='4'/>
+ <path d='M12 2v2'/><path d='M12 20v2'/>
+ <path d='M4.93 4.93l1.41 1.41'/><path d='M17.66 17.66l1.41 1.41'/>
+ <path d='M2 12h2'/><path d='M20 12h2'/>
+ <path d='M4.93 19.07l1.41-1.41'/><path d='M17.66 6.34l1.41-1.41'/></svg>"""
+
+_SVG_MOON = b"""<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'
+ stroke='currentColor' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'>
+ <path d='M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z'/></svg>"""
 
 
 _PIXMAP_CACHE: dict[tuple[int, int, str | None], QPixmap] = {}
@@ -192,7 +210,7 @@ def _make_icon_button(svg: bytes, size: int = 14, *, object_name: str = "tbBtn",
 
 
 class TitleBar(QFrame):
-    """Frameless-window title bar: icon + centered title/version + min/max/close.
+    """Frameless-window title bar: icon + centered title/version + theme/min/max/close.
 
     Drag anywhere on the bar (outside the buttons) to move the window using
     the platform's native window-move (so it works across X11/Wayland)."""
@@ -200,6 +218,7 @@ class TitleBar(QFrame):
     minimize_clicked = Signal()
     maximize_clicked = Signal()
     close_clicked = Signal()
+    theme_toggle_clicked = Signal()
 
     HEIGHT = 44
 
@@ -251,28 +270,63 @@ class TitleBar(QFrame):
         ctrl_lay.setContentsMargins(0, 0, 0, 0)
         ctrl_lay.setSpacing(2)
 
+        # Theme toggle (sun in dark mode → click to go light; moon in light
+        # mode → click to go dark). Mirrors the upscaler ThemeToggle pattern.
+        self._btn_theme = _make_icon_button(
+            self._theme_icon_svg(), 14,
+            tooltip=self._theme_tooltip(),
+            color=theme_color("text"),
+            parent=controls,
+        )
+        self._btn_theme.setFixedSize(36, 30)
+
         self._btn_min = _make_icon_button(
-            _SVG_MIN, 12, tooltip="Minimize", color="#ececf1", parent=controls,
+            _SVG_MIN, 12, tooltip="Minimize",
+            color=theme_color("text"), parent=controls,
         )
         self._btn_min.setFixedSize(36, 30)
         self._btn_max = _make_icon_button(
-            _SVG_MAX, 12, tooltip="Maximize", color="#ececf1", parent=controls,
+            _SVG_MAX, 12, tooltip="Maximize",
+            color=theme_color("text"), parent=controls,
         )
         self._btn_max.setFixedSize(36, 30)
         self._btn_close = _make_icon_button(
             _SVG_CLOSE, 12,
-            object_name="tbBtnClose", tooltip="Close", color="#ececf1", parent=controls,
+            object_name="tbBtnClose", tooltip="Close",
+            color=theme_color("text"), parent=controls,
         )
         self._btn_close.setFixedSize(36, 30)
 
+        self._btn_theme.clicked.connect(self.theme_toggle_clicked.emit)
         self._btn_min.clicked.connect(self.minimize_clicked.emit)
         self._btn_max.clicked.connect(self.maximize_clicked.emit)
         self._btn_close.clicked.connect(self.close_clicked.emit)
 
+        ctrl_lay.addWidget(self._btn_theme)
         ctrl_lay.addWidget(self._btn_min)
         ctrl_lay.addWidget(self._btn_max)
         ctrl_lay.addWidget(self._btn_close)
         layout.addWidget(controls)
+
+    @staticmethod
+    def _theme_icon_svg() -> bytes:
+        # Sun in dark mode (click → light), moon in light mode (click → dark).
+        return _SVG_SUN if current_theme() == "dark" else _SVG_MOON
+
+    @staticmethod
+    def _theme_tooltip() -> str:
+        return ("Switch to light mode" if current_theme() == "dark"
+                else "Switch to dark mode")
+
+    def apply_theme(self, _theme: str) -> None:
+        """Re-render every titlebar icon in the current theme's text colour
+        and swap the toggle's sun/moon. Called by MainWindow's theme listener."""
+        text = theme_color("text")
+        self._btn_theme.setIcon(QIcon(_icon_pixmap(self._theme_icon_svg(), 14, color=text)))
+        self._btn_theme.setToolTip(self._theme_tooltip())
+        self._btn_min.setIcon(QIcon(_icon_pixmap(_SVG_MIN, 12, color=text)))
+        self._btn_max.setIcon(QIcon(_icon_pixmap(_SVG_MAX, 12, color=text)))
+        self._btn_close.setIcon(QIcon(_icon_pixmap(_SVG_CLOSE, 12, color=text)))
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
@@ -527,6 +581,12 @@ class MainWindow(QMainWindow):
         self._batch_skipped = 0
         self._batch_total = 0
 
+        # Tracks every widget whose icon was painted with a theme-token colour
+        # so the theme listener can re-render them all on dark/light swap.
+        # Each entry: (widget, svg, size, token_name, kind) where kind is
+        # "btn" (QToolButton/QPushButton.setIcon) or "label" (QLabel.setPixmap).
+        self._themed_icons: list[tuple] = []
+
         # ---- Frameless chrome ----
         outer = QWidget(self)
         outer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -551,6 +611,7 @@ class MainWindow(QMainWindow):
         self.title_bar.minimize_clicked.connect(self.showMinimized)
         self.title_bar.maximize_clicked.connect(self._toggle_max)
         self.title_bar.close_clicked.connect(self.close)
+        self.title_bar.theme_toggle_clicked.connect(self._on_theme_toggle)
         chrome_layout.addWidget(self.title_bar)
 
         # ---- Main content ----
@@ -590,6 +651,39 @@ class MainWindow(QMainWindow):
             cache_subdir="cove-universal-converter",
         )
         QTimer.singleShot(4000, self._updater.check)
+
+        # ---- Theme: register listener so a runtime swap repaints icons ----
+        register_theme_listener(self._on_theme_changed)
+
+    # =========================================================
+    # Theme integration
+    # =========================================================
+
+    def _set_btn_icon(self, btn, svg: bytes, size: int, token: str) -> None:
+        """Set ``btn``'s icon from ``svg`` painted with ``theme_color(token)``
+        and remember it so the theme listener can re-render on dark/light swap."""
+        btn.setIcon(QIcon(_icon_pixmap(svg, size, color=theme_color(token))))
+        self._themed_icons.append((btn, svg, size, token, "btn"))
+
+    def _set_label_icon(self, label, svg: bytes, size: int, token: str) -> None:
+        label.setPixmap(_icon_pixmap(svg, size, color=theme_color(token)))
+        self._themed_icons.append((label, svg, size, token, "label"))
+
+    def _on_theme_toggle(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            toggle_theme(app)
+
+    def _on_theme_changed(self, theme: str) -> None:
+        # Re-render every themed icon with the new palette's colour.
+        for widget, svg, size, token, kind in self._themed_icons:
+            colour = theme_color(token)
+            if kind == "btn":
+                widget.setIcon(QIcon(_icon_pixmap(svg, size, color=colour)))
+            else:
+                widget.setPixmap(_icon_pixmap(svg, size, color=colour))
+        # Title bar manages its own buttons (and the toggle's sun/moon).
+        self.title_bar.apply_theme(theme)
 
     # =========================================================
     # Layout builders
@@ -636,17 +730,16 @@ class MainWindow(QMainWindow):
         # Bigger, clearly-tinted file icon framed in a soft surface tile so
         # it reads at a glance instead of disappearing into the background.
         ico_tile = QFrame(self._empty_state)
+        ico_tile.setObjectName("emptyTile")
+        ico_tile.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         ico_tile.setFixedSize(56, 56)
-        ico_tile.setStyleSheet(
-            f"background: {SURFACE_2}; border: 1px solid {BORDER_STRONG};"
-            "border-radius: 12px;"
-        )
         tile_lay = QVBoxLayout(ico_tile)
         tile_lay.setContentsMargins(0, 0, 0, 0)
         tile_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ico = QLabel(ico_tile)
-        ico.setPixmap(_icon_pixmap(_SVG_FILE, 28, color="#9a9aae"))
         ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_icon_label = ico
+        self._set_label_icon(ico, _SVG_FILE, 28, "text_dim")
         tile_lay.addWidget(ico)
         empty_lay.addWidget(ico_tile, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -689,7 +782,7 @@ class MainWindow(QMainWindow):
 
         self.dest_clear_btn = QToolButton(self._save_input)
         self.dest_clear_btn.setObjectName("clearInput")
-        self.dest_clear_btn.setIcon(QIcon(_icon_pixmap(_SVG_X_SMALL, 16, color="#6b6b80")))
+        self._set_btn_icon(self.dest_clear_btn, _SVG_X_SMALL, 16, "text_faint")
         self.dest_clear_btn.setIconSize(QSize(8, 8))
         self.dest_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dest_clear_btn.setToolTip("Reset — save next to each source file")
@@ -700,7 +793,7 @@ class MainWindow(QMainWindow):
 
         self.dest_browse_btn = QPushButton(" Browse…")
         self.dest_browse_btn.setObjectName("btnGhost")
-        self.dest_browse_btn.setIcon(QIcon(_icon_pixmap(_SVG_FOLDER, 26, color="#9a9aae")))
+        self._set_btn_icon(self.dest_browse_btn, _SVG_FOLDER, 26, "text_dim")
         self.dest_browse_btn.setIconSize(QSize(13, 13))
         self.dest_browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dest_browse_btn.clicked.connect(self._browse_output_dir)
@@ -714,7 +807,7 @@ class MainWindow(QMainWindow):
 
         self.gear_btn = QToolButton()
         self.gear_btn.setObjectName("iconBtn")
-        self.gear_btn.setIcon(QIcon(_icon_pixmap(_SVG_GEAR, 28, color="#9a9aae")))
+        self._set_btn_icon(self.gear_btn, _SVG_GEAR, 28, "text_dim")
         self.gear_btn.setIconSize(QSize(14, 14))
         self.gear_btn.setFixedSize(34, 34)
         self.gear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -731,9 +824,7 @@ class MainWindow(QMainWindow):
         # Revealed once a batch finishes with at least one successful output.
         self.open_file_btn = QPushButton(" Open file")
         self.open_file_btn.setObjectName("btnGhost")
-        self.open_file_btn.setIcon(
-            QIcon(_icon_pixmap(_SVG_FILE_OPEN, 26, color="#9a9aae")),
-        )
+        self._set_btn_icon(self.open_file_btn, _SVG_FILE_OPEN, 26, "text_dim")
         self.open_file_btn.setIconSize(QSize(13, 13))
         self.open_file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.open_file_btn.setToolTip("Open the most recent converted file")
@@ -743,9 +834,7 @@ class MainWindow(QMainWindow):
 
         self.show_folder_btn = QPushButton(" Show output folder")
         self.show_folder_btn.setObjectName("btnGhost")
-        self.show_folder_btn.setIcon(
-            QIcon(_icon_pixmap(_SVG_FOLDER_OPEN, 26, color="#9a9aae")),
-        )
+        self._set_btn_icon(self.show_folder_btn, _SVG_FOLDER_OPEN, 26, "text_dim")
         self.show_folder_btn.setIconSize(QSize(13, 13))
         self.show_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.show_folder_btn.setVisible(False)
@@ -827,7 +916,14 @@ class MainWindow(QMainWindow):
         FormatsDialog(self).exec()
 
     def _show_quality_dialog(self) -> None:
-        dialog = QualityDialog(self._settings, self)
+        # Show the PDF Options section whenever the queue has a PDF route on
+        # either side. The enhancement only runs on pdf→pdf, but exposing
+        # the toggle for pdf→other / other→pdf would be confusing.
+        show_pdf = any(
+            effective_suffix(r.path) == ".pdf" or r.target_ext == ".pdf"
+            for r in self._rows
+        )
+        dialog = QualityDialog(self._settings, self, show_pdf_section=show_pdf)
         if dialog.exec():
             self._settings = dialog.result_settings()
             self._toast.show_message("Quality settings saved")

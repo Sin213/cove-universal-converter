@@ -117,13 +117,26 @@ def _row_label(text: str) -> QLabel:
 
 
 class QualityDialog(QDialog):
-    def __init__(self, current: ConversionSettings, parent=None) -> None:
+    def __init__(
+        self,
+        current: ConversionSettings,
+        parent=None,
+        *,
+        show_pdf_section: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Quality settings")
         self.setModal(True)
         self.resize(540, 600)
 
         self._tracked: list[QWidget] = []
+        self._show_pdf_section = show_pdf_section
+        # Preserve the incoming PDF settings so a hidden section round-trips
+        # them unchanged — otherwise enabling the option in one session and
+        # later opening the dialog with no PDF queued would silently disable.
+        self._initial_enhance_scanned_pdf = current.enhance_scanned_pdf
+        self._initial_pdf_enhance_dpi = current.pdf_enhance_dpi
+        self.pdf_enhance_check: QCheckBox | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -265,6 +278,35 @@ class QualityDialog(QDialog):
         self._tracked.append(self.crf)
         self._tracked.append(self.webp)
 
+        # PDF Options — only shown when at least one queued file is on a
+        # PDF route. Independent of ``use_custom_quality``: scan-enhancement
+        # is its own opt-in that does not piggy-back on the global toggle.
+        if self._show_pdf_section:
+            v.addWidget(self._sep())
+            v.addLayout(self._labeled_row("PDF Options"))
+
+            self.pdf_enhance_check = QCheckBox("Enhance scanned PDF")
+            self.pdf_enhance_check.setChecked(current.enhance_scanned_pdf)
+            v.addWidget(self.pdf_enhance_check)
+
+            desc = QLabel(
+                "Brightens pages, boosts contrast, cleans gray backgrounds, "
+                "and improves readability for scanned documents.",
+                body,
+            )
+            desc.setObjectName("hint")
+            desc.setWordWrap(True)
+            v.addWidget(desc)
+
+            hint = QLabel(
+                "Best for scanned PDFs. May flatten selectable text "
+                "unless OCR is used.",
+                body,
+            )
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
+            v.addWidget(hint)
+
         scroll.setWidget(body)
         return scroll
 
@@ -324,6 +366,10 @@ class QualityDialog(QDialog):
     def result_settings(self) -> ConversionSettings:
         bitrate_str = self.audio_combo.currentText()
         bitrate = int(bitrate_str.rstrip("k"))
+        if self.pdf_enhance_check is not None:
+            enhance_pdf = self.pdf_enhance_check.isChecked()
+        else:
+            enhance_pdf = self._initial_enhance_scanned_pdf
         return ConversionSettings(
             use_custom_quality=self.enable_check.isChecked(),
             video_crf=self.crf.value(),
@@ -332,4 +378,6 @@ class QualityDialog(QDialog):
             jpeg_quality=self.jpeg.value(),
             webp_quality=self.webp.value(),
             max_concurrent=self.concurrent.value(),
+            enhance_scanned_pdf=enhance_pdf,
+            pdf_enhance_dpi=self._initial_pdf_enhance_dpi,
         )

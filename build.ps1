@@ -124,6 +124,9 @@ $commonArgs = @(
     '--hidden-import', 'reportlab',
     '--hidden-import', 'pillow_heif',
     '--hidden-import', 'pypdf',
+    '--hidden-import', 'pypdfium2',
+    '--hidden-import', 'pypdfium2_raw',
+    '--collect-all', 'pypdfium2',
     '--hidden-import', 'openpyxl',
     '--hidden-import', 'yaml',
     '--exclude-module', 'PySide6.QtWebEngineCore',
@@ -165,6 +168,9 @@ $portableName = "$App-portable"
     --hidden-import reportlab `
     --hidden-import pillow_heif `
     --hidden-import pypdf `
+    --hidden-import pypdfium2 `
+    --hidden-import pypdfium2_raw `
+    --collect-all pypdfium2 `
     --hidden-import openpyxl `
     --hidden-import yaml `
     --exclude-module PySide6.QtWebEngineCore `
