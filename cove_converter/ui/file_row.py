@@ -6,7 +6,7 @@ from pathlib import Path
 from cove_converter.routing import effective_stem
 
 
-@dataclass
+@dataclass(eq=False)
 class FileRow:
     path: Path
     target_ext: str
@@ -19,6 +19,9 @@ class FileRow:
     # Path the worker actually wrote to. Captured on success so later
     # open/show actions don't recompute against a now-changed output dir.
     completed_output: Path | None = None
+    # Per-row Enhance-PDF toggle. UI surfaces this only when target_ext
+    # is ``.pdf``; the engine itself only acts on PDF→PDF.
+    enhance_pdf: bool = False
 
     def resolve_output(self, dest_dir: Path | None) -> Path:
         if self.override_output is not None:

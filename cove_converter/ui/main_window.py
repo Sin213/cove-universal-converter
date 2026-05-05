@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -7,6 +8,7 @@ from PySide6.QtCore import (
     QEvent,
     QPoint,
     QPropertyAnimation,
+    QSignalBlocker,
     QSize,
     Qt,
     QTimer,
@@ -30,6 +32,7 @@ from PySide6.QtGui import (
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -55,6 +58,7 @@ from cove_converter.binaries import resource_path
 from cove_converter.engines import worker_for
 from cove_converter.routing import (
     SUPPORTED_FORMATS,
+    common_targets,
     effective_suffix,
     engine_for,
     info_for,
@@ -455,8 +459,16 @@ class _StatusCell(QWidget):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 14, 8)
-        layout.setSpacing(0)
+        layout.setSpacing(8)
         layout.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.convert_btn = QPushButton("Convert", self)
+        self.convert_btn.setObjectName("btnRowConvert")
+        self.convert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.convert_btn.setFixedHeight(24)
+        self.convert_btn.setMinimumWidth(74)
+        layout.addWidget(self.convert_btn)
+
         self.chip = QLabel("Ready", self)
         self.chip.setObjectName("statChip")
         self.chip.setProperty("state", "")
@@ -469,6 +481,16 @@ class _StatusCell(QWidget):
             self.chip.setProperty("state", cfg[1])
             self.chip.style().unpolish(self.chip)
             self.chip.style().polish(self.chip)
+
+        # Convert button visibility/enabled follows status:
+        #   Done            → hidden (open-file affordance takes over)
+        #   Queued/Processing → visible but disabled
+        #   anything else   → visible and enabled (Ready / Failed / etc.)
+        if state == "done":
+            self.convert_btn.setVisible(False)
+        else:
+            self.convert_btn.setVisible(True)
+            self.convert_btn.setEnabled(state not in ("queued", "processing"))
 
 
 # ---------------------------------------------------------------------------
@@ -574,8 +596,11 @@ class MainWindow(QMainWindow):
         self._output_dir: Path | None = None
         self._settings: ConversionSettings = default_settings()
 
-        self._pending_indices: list[int] = []
-        self._active_indices: set[int] = set()
+        # Tracked by row identity (not index) so Clear Failed during an
+        # in-flight conversion can't shift indices out from under live
+        # worker callbacks.
+        self._pending_rows: list[FileRow] = []
+        self._active_rows: set[FileRow] = set()
         self._batch_done = 0
         self._batch_failed = 0
         self._batch_skipped = 0
@@ -631,7 +656,15 @@ class MainWindow(QMainWindow):
         layout.addLayout(self._build_save_row())
         layout.addLayout(self._build_action_row())
 
+        # Initialise the batch-format dropdown to its empty-queue state.
+        self._refresh_batch_format_combo()
+
         self.setCentralWidget(outer)
+
+        # Tab order requirement: gear → batch dropdown → Batch Convert All.
+        # Must run after setCentralWidget so all widgets share the same window.
+        QWidget.setTabOrder(self.gear_btn, self.batch_format_combo)
+        QWidget.setTabOrder(self.batch_format_combo, self.convert_btn)
 
         # ---- Toast (overlay) ----
         self._toast = _Toast(self)
@@ -715,8 +748,8 @@ class MainWindow(QMainWindow):
         hh.setSectionResizeMode(_COL_TARGET, QHeaderView.ResizeMode.Fixed)
         hh.setSectionResizeMode(_COL_PROGRESS, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(_COL_STATUS, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(_COL_TARGET, 110)
-        self.table.setColumnWidth(_COL_STATUS, 130)
+        self.table.setColumnWidth(_COL_TARGET, 200)
+        self.table.setColumnWidth(_COL_STATUS, 210)
 
         wrap_lay.addWidget(self.table)
 
@@ -841,11 +874,33 @@ class MainWindow(QMainWindow):
         self.show_folder_btn.clicked.connect(self._show_output_folder)
         row.addWidget(self.show_folder_btn)
 
+        self.clear_failed_btn = QPushButton("Clear Failed")
+        self.clear_failed_btn.setObjectName("btnGhost")
+        self.clear_failed_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_failed_btn.setToolTip("Remove every Failed / Unsupported / Cancelled row")
+        self.clear_failed_btn.setEnabled(False)
+        self.clear_failed_btn.clicked.connect(self._clear_failed_rows)
+        row.addWidget(self.clear_failed_btn)
+
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.setObjectName("btnGhost")
         self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clear_btn.clicked.connect(self._clear)
         row.addWidget(self.clear_btn)
+
+        self.batch_format_combo = QComboBox()
+        self.batch_format_combo.setObjectName("qtarget")
+        self.batch_format_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.batch_format_combo.setToolTip("Apply format to all queued files")
+        self.batch_format_combo.setMinimumWidth(140)
+        # ``textActivated`` (vs. ``currentTextChanged``) fires on every user
+        # selection — including reselecting the same value after a per-row
+        # override — which is required by the "apply to all" workflow.
+        self.batch_format_combo.textActivated.connect(self._on_batch_format_changed)
+        # Suppress the synthetic currentTextChanged that fires while we
+        # repopulate the combo from _refresh_batch_format_combo.
+        self._batch_combo_repopulating = False
+        row.addWidget(self.batch_format_combo)
 
         self.convert_btn = QPushButton(" Batch Convert All")
         self.convert_btn.setObjectName("btnPrimary")
@@ -916,14 +971,10 @@ class MainWindow(QMainWindow):
         FormatsDialog(self).exec()
 
     def _show_quality_dialog(self) -> None:
-        # Show the PDF Options section whenever the queue has a PDF route on
-        # either side. The enhancement only runs on pdf→pdf, but exposing
-        # the toggle for pdf→other / other→pdf would be confusing.
-        show_pdf = any(
-            effective_suffix(r.path) == ".pdf" or r.target_ext == ".pdf"
-            for r in self._rows
-        )
-        dialog = QualityDialog(self._settings, self, show_pdf_section=show_pdf)
+        # Enhance-PDF moved to a per-row inline checkbox (visible whenever a
+        # row's target is .pdf), so the dialog itself no longer carries any
+        # PDF-specific section.
+        dialog = QualityDialog(self._settings, self)
         if dialog.exec():
             self._settings = dialog.result_settings()
             self._toast.show_message("Quality settings saved")
@@ -961,6 +1012,7 @@ class MainWindow(QMainWindow):
         elif paths:
             self._toast.show_message("No supported files", "warn")
         self._update_empty_state()
+        self._refresh_batch_format_combo()
 
     def _append_table_row(self, row: FileRow) -> None:
         r = self.table.rowCount()
@@ -972,23 +1024,46 @@ class MainWindow(QMainWindow):
         self.table.setCellWidget(r, _COL_FILE, file_cell)
 
         target_combo = _TargetCombo(ext, row.target_ext, parent=self.table)
+        target_combo.setMinimumWidth(86)
         target_combo.currentTextChanged.connect(
-            lambda ext, rr=row: setattr(rr, "target_ext", ext),
+            lambda new_ext, rr=row: self._on_target_changed(rr, new_ext),
+        )
+        enhance_check = QCheckBox("Enhance", self.table)
+        enhance_check.setObjectName("enhancePdfCheck")
+        enhance_check.setToolTip(
+            "Enhance scanned PDF — brightens pages and boosts contrast. "
+            "Applied only on PDF → PDF conversions."
+        )
+        enhance_check.setChecked(row.enhance_pdf)
+        enhance_check.setVisible(row.target_ext == ".pdf")
+        enhance_check.toggled.connect(
+            lambda checked, rr=row: setattr(rr, "enhance_pdf", checked),
         )
         wrap = QWidget(self.table)
         wlay = QHBoxLayout(wrap)
         wlay.setContentsMargins(8, 8, 8, 8)
+        wlay.setSpacing(8)
         wlay.addWidget(target_combo)
+        wlay.addWidget(enhance_check, stretch=1)
         self.table.setCellWidget(r, _COL_TARGET, wrap)
 
         prog = _ProgressCell(self.table)
         self.table.setCellWidget(r, _COL_PROGRESS, prog)
 
         status = _StatusCell(self.table)
+        status.convert_btn.clicked.connect(
+            lambda _=False, rr=row: self._convert_one(rr),
+        )
         self.table.setCellWidget(r, _COL_STATUS, status)
 
         self._row_widgets.append(
-            {"file": file_cell, "target": target_combo, "progress": prog, "status": status},
+            {
+                "file": file_cell,
+                "target": target_combo,
+                "enhance_pdf": enhance_check,
+                "progress": prog,
+                "status": status,
+            },
         )
 
     def _human_size(self, path: Path) -> str:
@@ -1011,17 +1086,76 @@ class MainWindow(QMainWindow):
         self._rows.clear()
         self._row_widgets.clear()
         self.table.setRowCount(0)
-        self._pending_indices.clear()
-        self._active_indices.clear()
+        self._pending_rows.clear()
+        self._active_rows.clear()
         self.status_msg.setText("")
         self.open_file_btn.setVisible(False)
         self.show_folder_btn.setVisible(False)
         self._update_empty_state()
+        self._refresh_batch_format_combo()
+        self._refresh_clear_failed_state()
 
     def _update_empty_state(self) -> None:
         empty = self.table.rowCount() == 0
         self._empty_state.setVisible(empty)
         self.table.setVisible(not empty)
+
+    # =========================================================
+    # Batch format dropdown
+    # =========================================================
+
+    def _refresh_batch_format_combo(self) -> None:
+        combo = self.batch_format_combo
+        self._batch_combo_repopulating = True
+        try:
+            with QSignalBlocker(combo):
+                combo.clear()
+                if not self._rows:
+                    combo.addItem("—")
+                    combo.setEnabled(False)
+                    return
+                exts = [effective_suffix(r.path) for r in self._rows]
+                shared = common_targets(exts)
+                if not shared:
+                    combo.addItem("No common format")
+                    combo.setEnabled(False)
+                    return
+                combo.addItem("Apply format to all…")
+                for ext in shared:
+                    combo.addItem(ext)
+                combo.setEnabled(True)
+        finally:
+            self._batch_combo_repopulating = False
+
+    def _on_batch_format_changed(self, text: str) -> None:
+        if self._batch_combo_repopulating:
+            return
+        if not text or text in ("—", "No common format", "Apply format to all…"):
+            return
+        self._apply_batch_format(text)
+
+    def _apply_batch_format(self, ext: str) -> None:
+        for i, row in enumerate(self._rows):
+            cells = self._row_widgets[i] if i < len(self._row_widgets) else None
+            target_combo = cells.get("target") if cells else None
+            if target_combo is not None and target_combo.findText(ext) >= 0:
+                with QSignalBlocker(target_combo):
+                    target_combo.setCurrentText(ext)
+            self._on_target_changed(row, ext)
+
+    def _on_target_changed(self, row: FileRow, ext: str) -> None:
+        """Hook fired whenever a row's target_ext changes (per-row combo or
+        batch dropdown). Updates per-row state and toggles the Enhance-PDF
+        checkbox visibility (only meaningful when target is .pdf)."""
+        row.target_ext = ext
+        try:
+            index = self._rows.index(row)
+        except ValueError:
+            return
+        cells = self._row_widgets[index]
+        check = cells.get("enhance_pdf")
+        if check is not None:
+            check.setVisible(ext == ".pdf")
 
     def _show_context_menu(self, pos: QPoint) -> None:
         index = self.table.indexAt(pos)
@@ -1072,18 +1206,58 @@ class MainWindow(QMainWindow):
                 self._row_widgets.pop(r)
                 self.table.removeRow(r)
         self._update_empty_state()
+        self._refresh_batch_format_combo()
+        self._refresh_clear_failed_state()
+
+    @staticmethod
+    def _is_failed_terminal(status: str) -> bool:
+        # Targets exactly the non-success terminal states the handoff
+        # locked in (Failed, Unsupported, Cancelled). Never includes Done
+        # or any in-flight state.
+        return status.startswith("Failed") or status in ("Unsupported", "Cancelled")
+
+    def _refresh_clear_failed_state(self) -> None:
+        has_failed = any(self._is_failed_terminal(r.status) for r in self._rows)
+        self.clear_failed_btn.setEnabled(has_failed)
+
+    def _clear_failed_rows(self) -> None:
+        indices = [
+            i for i, r in enumerate(self._rows)
+            if self._is_failed_terminal(r.status)
+        ]
+        if not indices:
+            return
+        for r in reversed(indices):
+            row = self._rows[r]
+            # Failed-terminal rows have no live worker, but defensive cancel
+            # in case the predicate is broadened later.
+            if row.worker is not None and row.worker.isRunning():
+                row.worker.cancel()
+            self._rows.pop(r)
+            self._row_widgets.pop(r)
+            self.table.removeRow(r)
+        self._update_empty_state()
+        self._refresh_batch_format_combo()
+        self._refresh_clear_failed_state()
 
     # =========================================================
     # Conversion / queue
     # =========================================================
 
     def _convert_all(self) -> None:
-        eligible: list[int] = []
-        resolved: list[tuple[int, Path]] = []
+        eligible: list[FileRow] = []
+        resolved: list[tuple[FileRow, Path]] = []
         pre_skipped = 0
         pre_failed = 0
         for i, row in enumerate(self._rows):
-            if row.status in ("Done", "Processing"):
+            # Skip rows that are already running, queued, or finished.
+            # Excluding "Queued" prevents re-enqueueing a row that was just
+            # added by a per-row Convert click.
+            if row.status in ("Done", "Processing", "Queued"):
+                continue
+            # Defensive dedup against the live queue state in case the row's
+            # status string lags a fraction behind its presence in pending/active.
+            if row in self._pending_rows or row in self._active_rows:
                 continue
             if engine_for(effective_suffix(row.path), row.target_ext) is None:
                 self._set_status(i, "Unsupported")
@@ -1094,41 +1268,93 @@ class MainWindow(QMainWindow):
                 self._set_status(i, "Failed: output would overwrite source")
                 pre_failed += 1
                 continue
-            eligible.append(i)
-            resolved.append((i, out))
+            eligible.append(row)
+            resolved.append((row, out))
 
         if not eligible:
             self.status_msg.setText("Nothing to convert.")
             self._toast.show_message("Nothing to convert")
             return
 
-        conflicts = [(i, out) for i, out in resolved if out.exists()]
+        conflicts = [(r, out) for r, out in resolved if out.exists()]
         if conflicts:
             choice = self._ask_overwrite(conflicts)
             if choice == "cancel":
                 return
             if choice == "rename":
                 reserved: set[Path] = set()
-                for i, out in conflicts:
+                for r, out in conflicts:
                     candidate = unique_path(out, reserved)
-                    self._rows[i].override_output = candidate
+                    r.override_output = candidate
                     reserved.add(candidate)
 
         self.convert_btn.setEnabled(False)
         self.open_file_btn.setVisible(False)
         self.show_folder_btn.setVisible(False)
-        self._batch_total = len(eligible)
-        self._batch_done = 0
-        self._batch_failed = pre_failed
-        self._batch_skipped = pre_skipped
-        self._pending_indices = list(eligible)
+        # If a per-row Convert is already in flight, merge with its existing
+        # counters instead of resetting — otherwise its eventual completion
+        # would land on a freshly-zeroed _batch_done and skew the totals.
+        if self._batch_total == 0:
+            self._batch_done = 0
+            self._batch_failed = pre_failed
+            self._batch_skipped = pre_skipped
+        else:
+            self._batch_failed += pre_failed
+            self._batch_skipped += pre_skipped
+        self._batch_total += len(eligible)
+        self._pending_rows.extend(eligible)
         # Mark all eligible rows as queued visually.
-        for i in eligible:
-            self._set_status(i, "Queued")
+        for r in eligible:
+            try:
+                self._set_status(self._rows.index(r), "Queued")
+            except ValueError:
+                continue
         self.status_msg.setText(f"Converting {self._batch_total}…")
         self._pump_queue()
 
-    def _ask_overwrite(self, conflicts: list[tuple[int, Path]]) -> str:
+    def _convert_one(self, row: FileRow) -> None:
+        """Single-row variant of _convert_all — enqueues exactly one row
+        through the existing _pump_queue (so the concurrency cap is honoured
+        and a single-file convert can run in parallel with a Batch run)."""
+        try:
+            index = self._rows.index(row)
+        except ValueError:
+            return
+        if row.status in ("Queued", "Processing", "Done"):
+            return
+
+        if engine_for(effective_suffix(row.path), row.target_ext) is None:
+            self._set_status(index, "Unsupported")
+            return
+
+        out = row.resolve_output(self._output_dir)
+        if out.resolve() == row.path.resolve():
+            self._set_status(index, "Failed: output would overwrite source")
+            return
+
+        if out.exists():
+            choice = self._ask_overwrite([(row, out)])
+            if choice == "cancel":
+                return
+            if choice == "rename":
+                row.override_output = unique_path(out)
+
+        if row in self._pending_rows or row in self._active_rows:
+            return
+
+        self._pending_rows.append(row)
+        # Bump the running batch counters so _announce_batch_done lands when
+        # this single conversion finishes (or merges into an in-flight batch).
+        if self._batch_total == 0:
+            self._batch_done = 0
+            self._batch_failed = 0
+            self._batch_skipped = 0
+        self._batch_total += 1
+        self._set_status(index, "Queued")
+        self.status_msg.setText("Converting…")
+        self._pump_queue()
+
+    def _ask_overwrite(self, conflicts: list[tuple[FileRow, Path]]) -> str:
         preview = "\n".join(f"• {p.name}" for _, p in conflicts[:8])
         if len(conflicts) > 8:
             preview += f"\n… and {len(conflicts) - 8} more"
@@ -1151,17 +1377,20 @@ class MainWindow(QMainWindow):
 
     def _pump_queue(self) -> None:
         while (
-            self._pending_indices
-            and len(self._active_indices) < max(1, self._settings.max_concurrent)
+            self._pending_rows
+            and len(self._active_rows) < max(1, self._settings.max_concurrent)
         ):
-            index = self._pending_indices.pop(0)
-            self._start_row(index)
+            row = self._pending_rows.pop(0)
+            self._start_row(row)
 
-        if not self._pending_indices and not self._active_indices and self._batch_total > 0:
+        if not self._pending_rows and not self._active_rows and self._batch_total > 0:
             self._announce_batch_done()
 
-    def _start_row(self, index: int) -> None:
-        row = self._rows[index]
+    def _start_row(self, row: FileRow) -> None:
+        try:
+            index = self._rows.index(row)
+        except ValueError:
+            return
         engine = engine_for(effective_suffix(row.path), row.target_ext)
         if engine is None:
             self._set_status(index, "Unsupported")
@@ -1170,19 +1399,41 @@ class MainWindow(QMainWindow):
         output_path = row.resolve_output(self._output_dir)
 
         worker_cls = worker_for(engine)
-        worker = worker_cls(row.path, output_path, self._settings)
+        # Merge the per-row Enhance-PDF flag into a per-call settings copy
+        # so the global ``self._settings`` stays the source of every other
+        # quality knob.
+        row_settings = replace(self._settings, enhance_scanned_pdf=row.enhance_pdf)
+        worker = worker_cls(row.path, output_path, row_settings)
         row.worker = worker
 
-        worker.progress.connect(lambda pct, i=index: self._set_progress(i, pct))
-        worker.status.connect(lambda text, i=index: self._set_status(i, text))
-        worker.finished.connect(lambda i=index: self._on_worker_finished(i))
-        self._active_indices.add(index)
+        # Capture the row, not its index — Clear Failed during an in-flight
+        # conversion can shift indices but the row identity stays stable.
+        worker.progress.connect(lambda pct, rr=row: self._on_worker_progress(rr, pct))
+        worker.status.connect(lambda text, rr=row: self._on_worker_status(rr, text))
+        worker.finished.connect(lambda rr=row: self._on_worker_finished(rr))
+        self._active_rows.add(row)
         worker.start()
 
-    def _on_worker_finished(self, index: int) -> None:
-        self._active_indices.discard(index)
-        if 0 <= index < len(self._rows):
-            row = self._rows[index]
+    def _on_worker_progress(self, row: FileRow, pct: int) -> None:
+        try:
+            index = self._rows.index(row)
+        except ValueError:
+            return
+        self._set_progress(index, pct)
+
+    def _on_worker_status(self, row: FileRow, text: str) -> None:
+        try:
+            index = self._rows.index(row)
+        except ValueError:
+            return
+        self._set_status(index, text)
+
+    def _on_worker_finished(self, row: FileRow) -> None:
+        self._active_rows.discard(row)
+        # Row may have been removed (e.g. via Clear All) before the worker
+        # finished emitting; in that case skip the per-row accounting but
+        # still pump the queue so the next conversion can start.
+        if row in self._rows:
             status = row.status
             if status == "Done":
                 self._batch_done += 1
@@ -1304,6 +1555,7 @@ class MainWindow(QMainWindow):
 
         if 0 <= index < len(self._rows):
             self._rows[index].status = text
+        self._refresh_clear_failed_state()
 
     # =========================================================
     # Frameless window helpers

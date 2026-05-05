@@ -432,6 +432,20 @@ QPushButton#btnGhost {{
 QPushButton#btnGhost:hover {{ color: {TEXT}; background: {SURFACE_2}; border: 1px solid {BORDER_STRONG}; }}
 QPushButton#btnGhost:disabled {{ color: {TEXT_FAINT}; background: {SURFACE}; }}
 
+/* Per-row Convert button (lives inside _StatusCell). Compact variant of the
+   ghost button so it fits inside the 56 px row without crowding the chip. */
+QPushButton#btnRowConvert {{
+    color: {TEXT_DIM};
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 2px 10px;
+    font-size: 12px;
+    font-weight: 500;
+}}
+QPushButton#btnRowConvert:hover {{ color: {TEXT}; background: {SURFACE_2}; border: 1px solid {BORDER_STRONG}; }}
+QPushButton#btnRowConvert:disabled {{ color: {TEXT_FAINT}; background: {SURFACE}; }}
+
 QPushButton#btnPrimary {{
     color: {BTN_PRIM_TXT};
     background: {ACCENT};
