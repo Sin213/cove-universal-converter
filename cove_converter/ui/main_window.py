@@ -892,7 +892,17 @@ class MainWindow(QMainWindow):
         self.batch_format_combo.setObjectName("qtarget")
         self.batch_format_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self.batch_format_combo.setToolTip("Apply format to all queued files")
-        self.batch_format_combo.setMinimumWidth(140)
+        # Placeholder is the resting label — shown whenever ``currentIndex``
+        # is -1, which is also the state we reset to after each apply so
+        # the dropdown menu only ever lists the actual format choices (no
+        # redundant "Apply format to all…" entry).
+        self.batch_format_combo.setPlaceholderText("Apply format to all")
+        # Width sized to the placeholder text so it never truncates to
+        # "Apply format to al"; clamp via font metrics so it stays correct
+        # under different fonts / DPI scaling.
+        _fm = self.batch_format_combo.fontMetrics()
+        _placeholder_w = _fm.horizontalAdvance("Apply format to all")
+        self.batch_format_combo.setMinimumWidth(_placeholder_w + 48)
         # ``textActivated`` (vs. ``currentTextChanged``) fires on every user
         # selection — including reselecting the same value after a per-row
         # override — which is required by the "apply to all" workflow.
@@ -1120,9 +1130,13 @@ class MainWindow(QMainWindow):
                     combo.addItem("No common format")
                     combo.setEnabled(False)
                     return
-                combo.addItem("Apply format to all…")
+                # Only the actual format choices live in the dropdown; the
+                # placeholder ("Apply format to all") is rendered by Qt
+                # whenever ``currentIndex`` is -1, which is the resting
+                # state we keep the combo in.
                 for ext in shared:
                     combo.addItem(ext)
+                combo.setCurrentIndex(-1)
                 combo.setEnabled(True)
         finally:
             self._batch_combo_repopulating = False
@@ -1130,9 +1144,14 @@ class MainWindow(QMainWindow):
     def _on_batch_format_changed(self, text: str) -> None:
         if self._batch_combo_repopulating:
             return
-        if not text or text in ("—", "No common format", "Apply format to all…"):
+        if not text or text in ("—", "No common format"):
             return
         self._apply_batch_format(text)
+        # Snap back to the placeholder so the next selection — even of the
+        # same format — fires ``textActivated`` again, matching the
+        # pre-existing "apply to all" reselect behaviour.
+        with QSignalBlocker(self.batch_format_combo):
+            self.batch_format_combo.setCurrentIndex(-1)
 
     def _apply_batch_format(self, ext: str) -> None:
         for i, row in enumerate(self._rows):
