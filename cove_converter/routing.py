@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 # Compound extensions whose ``Path.suffix`` (e.g. ``.gz``) doesn't carry
 # enough information to route. Anything listed here must also be a key in
@@ -115,6 +116,28 @@ def info_for(extension: str) -> FormatInfo | None:
 def targets_for(extension: str) -> tuple[str, ...]:
     info = info_for(extension)
     return info.targets if info else ()
+
+
+def common_targets(extensions: Iterable[str]) -> tuple[str, ...]:
+    """Intersection of ``targets_for(ext)`` across ``extensions``.
+
+    Order is taken from the first input's ``targets_for`` so the dropdown
+    is deterministic instead of arbitrary set-iteration order.
+    Returns ``()`` for empty input or when the intersection is empty
+    (e.g. mixing image + video).
+    """
+    exts = list(extensions)
+    if not exts:
+        return ()
+    first = targets_for(exts[0])
+    if not first:
+        return ()
+    common = set(first)
+    for ext in exts[1:]:
+        common &= set(targets_for(ext))
+        if not common:
+            return ()
+    return tuple(t for t in first if t in common)
 
 
 def engine_for(ext_in: str, ext_out: str) -> str | None:
