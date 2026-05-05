@@ -22,6 +22,7 @@ from typing import Callable
 
 from cove_converter.binaries import PANDOC, resolve
 from cove_converter.engines.base import BaseConverterWorker
+from cove_converter.engines.pdf_flatten import flatten_pdf, has_pdf_javascript
 
 
 # ---- Scanned-PDF enhancement -----------------------------------------------
@@ -315,6 +316,35 @@ class PdfWorker(BaseConverterWorker):
     def _convert(self) -> None:
         in_ext  = self.input_path.suffix.lower()
         out_ext = self.output_path.suffix.lower()
+
+        # "Smart" PDFs — JavaScript-driven content / form filling —
+        # render visually wrong (or blank) under our normal byte-copy
+        # path. Detect them by literal byte scan and rasterise every
+        # page into a static multi-page PDF before downstream sees it.
+        #
+        # Scope is intentionally narrow: only PDF → PDF runs through
+        # flatten. Rasterising destroys the text layer, so PDF →
+        # txt/md/html/docx/odt/rtf/epub keeps using pypdf, which
+        # already reads stored AcroForm field values directly.
+        if (
+            in_ext == ".pdf"
+            and out_ext == ".pdf"
+            and has_pdf_javascript(self.input_path)
+        ):
+            # Emit a small progress tick *before* flatten so the user
+            # sees motion immediately even on a fast failure path.
+            self.progress.emit(2)
+            # ``flatten_pdf`` validates and removes its own bad output,
+            # so it's safe to point it at ``self.output_path`` directly
+            # — the worker-owned temp file. The atomic ``os.replace``
+            # in BaseConverterWorker.run finalises it.
+            flatten_pdf(
+                self.input_path,
+                self.output_path,
+                progress=self.progress.emit,
+                cancelled=lambda: self._cancel,
+            )
+            return
 
         # PDF → PDF: optional scan enhancement, otherwise byte-identical copy.
         # ``self.output_path`` is the worker-owned temp path; the atomic

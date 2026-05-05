@@ -74,7 +74,10 @@ SUPPORTED_FORMATS: dict[str, FormatInfo] = {
 
     # ---- Documents ----
     # PdfEngine handles anything with .pdf on either side; Pandoc does the rest.
-    ".pdf":  FormatInfo("Pdf",    (".docx", ".odt", ".rtf", ".epub", ".md", ".html", ".txt")),
+    # ``.pdf`` is the first target so PDF inputs default to PDF→PDF, which
+    # is the smart-PDF flattening / scan-enhance / byte-identical copy path.
+    # The doc targets stay available for users who want PDF→DOCX/etc.
+    ".pdf":  FormatInfo("Pdf",    (".pdf", ".docx", ".odt", ".rtf", ".epub", ".md", ".html", ".txt")),
     ".docx": FormatInfo("Pandoc", _DOC_TARGETS),
     ".odt":  FormatInfo("Pandoc", _DOC_TARGETS),
     ".rtf":  FormatInfo("Pandoc", _DOC_TARGETS),

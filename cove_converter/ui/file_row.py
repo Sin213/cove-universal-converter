@@ -30,7 +30,17 @@ class FileRow:
         # rebuilt name doesn't end up as ``foo.tar.zip``.
         stem = effective_stem(self.path)
         parent = self.path.parent if dest_dir is None else dest_dir
-        return parent / (stem + self.target_ext)
+        candidate = parent / (stem + self.target_ext)
+        # When target_ext matches the source extension and no separate
+        # destination directory was chosen, the natural candidate path is
+        # the source itself — which the overwrite guard rejects before
+        # the worker runs. Nudge to a ``stem (1).ext`` variant so PDF→PDF
+        # (the smart-PDF flatten path) works out of the box. Any further
+        # collision with a non-source file still triggers the existing
+        # overwrite-confirm dialog.
+        if candidate.resolve() == self.path.resolve():
+            candidate = parent / f"{stem} (1){self.target_ext}"
+        return candidate
 
 
 def unique_path(path: Path, reserved: set[Path] | None = None) -> Path:
