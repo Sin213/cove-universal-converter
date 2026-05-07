@@ -510,6 +510,94 @@ def test_flatten_output_size_floor_validation(tmp_path, monkeypatch):
     assert not dst.exists()
 
 
+# ---- Concurrency / batch isolation ----------------------------------------
+
+def test_flatten_concurrent_batch_does_not_race_pdfium(tmp_path):
+    """Regression: PDFium is not thread-safe. Running ``flatten_pdf``
+    concurrently from multiple worker threads (the batch path runs up
+    to ``settings.max_concurrent`` workers in parallel, default 3) used
+    to surface as ``Failed to load page`` / ``Data format error`` and,
+    intermittently, native crashes that took the whole process down —
+    leaving empty ``.cove-part-*.pdf`` temps behind because
+    ``BaseConverterWorker._cleanup_temp`` never ran. The fix is a
+    module-level lock that serialises PDFium use across threads;
+    this test proves the lock is in place by running four concurrent
+    flatten threads on JS-marker PDFs and asserting all succeed.
+    """
+    import threading
+
+    srcs = []
+    for i in range(4):
+        s = tmp_path / f"smart_{i}.pdf"
+        _synth_js_pdf(s, pages=3)
+        srcs.append(s)
+
+    results: dict[int, tuple[str, object]] = {}
+
+    def _run(i: int, src: Path) -> None:
+        dst = tmp_path / f"out_{i}.pdf"
+        try:
+            flatten_pdf(src, dst)
+            results[i] = ("ok", dst.stat().st_size)
+        except Exception as exc:  # noqa: BLE001 — surface any PDFium crash
+            results[i] = ("err", repr(exc))
+
+    threads = [threading.Thread(target=_run, args=(i, s)) for i, s in enumerate(srcs)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    failures = {i: r for i, r in results.items() if r[0] != "ok"}
+    assert not failures, (
+        f"concurrent flatten_pdf must not race PDFium; failures: {failures}"
+    )
+
+
+def test_flatten_failure_in_one_thread_does_not_break_others(tmp_path):
+    """Batch isolation: one bad PDF in a concurrent run must raise
+    cleanly in its own thread without corrupting PDFium state for the
+    other threads. The user-reported symptom was that a single problem
+    PDF in a batch took the whole batch down with it.
+    """
+    import threading
+
+    bad = tmp_path / "junk.pdf"
+    bad.write_bytes(b"this is not a pdf")
+    good_a = tmp_path / "ok_a.pdf"
+    good_b = tmp_path / "ok_b.pdf"
+    _synth_js_pdf(good_a, pages=2)
+    _synth_js_pdf(good_b, pages=2)
+
+    results: dict[str, tuple[str, object]] = {}
+
+    def _run(label: str, src: Path) -> None:
+        dst = tmp_path / f"out_{label}.pdf"
+        try:
+            flatten_pdf(src, dst)
+            results[label] = ("ok", dst.stat().st_size)
+        except Exception as exc:  # noqa: BLE001
+            results[label] = ("err", repr(exc))
+
+    threads = [
+        threading.Thread(target=_run, args=("bad", bad)),
+        threading.Thread(target=_run, args=("good_a", good_a)),
+        threading.Thread(target=_run, args=("good_b", good_b)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results["bad"][0] == "err", "garbage input must raise"
+    assert results["good_a"][0] == "ok", (
+        f"good PDF must succeed despite a sibling failure: {results['good_a']}"
+    )
+    assert results["good_b"][0] == "ok", (
+        f"good PDF must succeed despite a sibling failure: {results['good_b']}"
+    )
+
+
 # ---- Routing through PdfWorker --------------------------------------------
 
 def _drive_convert(src: Path, dst: Path) -> None:

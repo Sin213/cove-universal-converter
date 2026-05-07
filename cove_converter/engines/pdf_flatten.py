@@ -36,11 +36,26 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import threading
 import warnings
 from pathlib import Path
 from typing import Callable
 
 _log = logging.getLogger("cove_converter.pdf_flatten")
+
+
+# PDFium's native API is not thread-safe. Concurrent ``PdfDocument`` /
+# ``init_forms`` / ``page.render`` calls from worker threads (the batch path
+# runs up to ``settings.max_concurrent`` workers in parallel) race on
+# PDFium's process-global state, which surfaces as ``Failed to load page``
+# / ``Data format error`` from pypdfium2 and — worse — occasional native
+# crashes that bypass Python's exception handling and take the whole
+# process down (the leftover empty ``.cove-part-*.pdf`` files we saw in
+# the wild are the smoking gun: ``BaseConverterWorker._cleanup_temp``
+# never ran). Serialise the entire flatten so concurrent batch workers
+# can't trip the race. Single-file conversions hit this lock once and
+# pay no contention.
+_PDFIUM_LOCK = threading.Lock()
 
 
 # Substring markers that the user's spec asks us to detect. ``/JavaScript``
@@ -155,6 +170,19 @@ def flatten_pdf(
     if src.resolve() == dst.resolve():
         raise RuntimeError("Refusing to flatten PDF in place")
 
+    # PDFium is not thread-safe. Serialise the body so concurrent batch
+    # workers can't race PDFium's global state (see ``_PDFIUM_LOCK``).
+    with _PDFIUM_LOCK:
+        _flatten_pdf_locked(src, dst, progress=progress, cancelled=cancelled)
+
+
+def _flatten_pdf_locked(
+    src: Path,
+    dst: Path,
+    *,
+    progress: Callable[[int], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> None:
     # Imports are local because pypdfium2 / PIL are heavy and the module is
     # also imported for the cheap ``has_pdf_javascript`` detection path.
     import pypdfium2 as pdfium
