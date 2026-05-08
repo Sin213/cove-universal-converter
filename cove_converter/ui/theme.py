@@ -309,6 +309,47 @@ QHeaderView::section {{
     text-transform: uppercase;
 }}
 
+/* ===== Bottom log panel ===== */
+QFrame#logPanel {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+}}
+QWidget#logHeader {{
+    background: {O2};
+    border-bottom: 1px solid {BORDER};
+    min-height: 32px;
+}}
+QToolButton#logToggle {{
+    color: {TEXT_DIM};
+    background: transparent;
+    border: none;
+    padding: 0;
+    font-family: {MONO_STACK};
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+}}
+QToolButton#logToggle:hover {{ color: {TEXT}; }}
+QPushButton#logClear {{
+    color: {TEXT_FAINT};
+    background: transparent;
+    border: none;
+    padding: 3px 6px;
+    font-family: {MONO_STACK};
+    font-size: 11px;
+}}
+QPushButton#logClear:hover {{ color: {TEXT}; background: {O6}; border-radius: 5px; }}
+QPlainTextEdit#logView {{
+    color: {TEXT_DIM};
+    background: transparent;
+    border: none;
+    padding: 8px 10px 10px 10px;
+    font-family: {MONO_STACK};
+    font-size: 11px;
+    selection-background-color: {ACCENT_SOFT};
+}}
+
 /* ===== Empty-state file tile (was inline-styled — now QSS so it themes) ===== */
 QFrame#emptyTile {{
     background: {SURFACE_2};
