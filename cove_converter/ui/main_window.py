@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -82,6 +83,7 @@ from cove_converter.ui.theme import (
 
 
 _COL_FILE, _COL_TARGET, _COL_PROGRESS, _COL_STATUS = range(4)
+_MAX_LOG_ENTRIES = 200
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +610,8 @@ class MainWindow(QMainWindow):
         self._batch_failed = 0
         self._batch_skipped = 0
         self._batch_total = 0
+        self._log_entries: list[tuple[str, str, str, str | None]] = []
+        self._log_collapsed = False
 
         # Tracks every widget whose icon was painted with a theme-token colour
         # so the theme listener can re-render them all on dark/light swap.
@@ -656,6 +660,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.drop_zone)
 
         layout.addWidget(self._build_queue(), stretch=1)
+        layout.addWidget(self._build_log_panel())
         layout.addLayout(self._build_save_row())
         layout.addLayout(self._build_action_row())
 
@@ -837,6 +842,48 @@ class MainWindow(QMainWindow):
 
         return row
 
+    def _build_log_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("logPanel")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        panel_lay = QVBoxLayout(panel)
+        panel_lay.setContentsMargins(0, 0, 0, 0)
+        panel_lay.setSpacing(0)
+
+        head = QWidget(panel)
+        head.setObjectName("logHeader")
+        head_lay = QHBoxLayout(head)
+        head_lay.setContentsMargins(10, 0, 10, 0)
+        head_lay.setSpacing(8)
+
+        self.log_toggle_btn = QToolButton(head)
+        self.log_toggle_btn.setObjectName("logToggle")
+        self.log_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.log_toggle_btn.clicked.connect(self._toggle_log_panel)
+        head_lay.addWidget(self.log_toggle_btn)
+        head_lay.addStretch(1)
+
+        self.log_clear_btn = QPushButton("Clear", head)
+        self.log_clear_btn.setObjectName("logClear")
+        self.log_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.log_clear_btn.clicked.connect(self._clear_log_panel)
+        head_lay.addWidget(self.log_clear_btn)
+        panel_lay.addWidget(head)
+
+        self.log_view = QPlainTextEdit(panel)
+        self.log_view.setObjectName("logView")
+        self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.log_view.setPlaceholderText("No entries yet.")
+        self.log_view.setMaximumHeight(140)
+        font = QFont("monospace")
+        font.setStyleHint(QFont.TypeWriter)
+        self.log_view.setFont(font)
+        panel_lay.addWidget(self.log_view)
+
+        self._refresh_log_panel()
+        return panel
+
     def _build_action_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -1006,11 +1053,49 @@ class MainWindow(QMainWindow):
         self.dest_clear_btn.setVisible(False)
 
     # =========================================================
+    # Bottom log panel
+    # =========================================================
+
+    def _append_log(self, level: str, text: str, detail: str | None = None) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        clean_text = " ".join((text or "").split())
+        clean_detail = " ".join(detail.split()) if detail else None
+        self._log_entries.append((timestamp, level, clean_text, clean_detail))
+        if len(self._log_entries) > _MAX_LOG_ENTRIES:
+            self._log_entries = self._log_entries[-_MAX_LOG_ENTRIES:]
+        self._refresh_log_panel()
+
+    def _refresh_log_panel(self) -> None:
+        if not hasattr(self, "log_toggle_btn"):
+            return
+        count = len(self._log_entries)
+        label = "entry" if count == 1 else "entries"
+        chevron = ">" if self._log_collapsed else "v"
+        self.log_toggle_btn.setText(f"{chevron}  LOG · {count} {label}")
+        self.log_view.setVisible(not self._log_collapsed)
+        lines = []
+        for timestamp, level, text, detail in self._log_entries:
+            suffix = f" - {detail}" if detail else ""
+            lines.append(f"{timestamp}  {level.upper():5}  {text}{suffix}")
+        self.log_view.setPlainText("\n".join(lines))
+        scroll = self.log_view.verticalScrollBar()
+        scroll.setValue(scroll.maximum())
+
+    def _toggle_log_panel(self) -> None:
+        self._log_collapsed = not self._log_collapsed
+        self._refresh_log_panel()
+
+    def _clear_log_panel(self) -> None:
+        self._log_entries.clear()
+        self._refresh_log_panel()
+
+    # =========================================================
     # Row management
     # =========================================================
 
     def _add_files(self, paths: list[Path]) -> None:
         accepted = 0
+        accepted_names: list[str] = []
         for path in paths:
             info = info_for(effective_suffix(path))
             if info is None:
@@ -1019,11 +1104,17 @@ class MainWindow(QMainWindow):
             self._rows.append(row)
             self._append_table_row(row)
             accepted += 1
+            accepted_names.append(path.name)
 
         if accepted:
             self._toast.show_message(f"Added {accepted} file{'s' if accepted != 1 else ''}")
+            if accepted == 1:
+                self._append_log("info", "Added file", accepted_names[0])
+            else:
+                self._append_log("info", f"Added {accepted} files")
         elif paths:
             self._toast.show_message("No supported files", "warn")
+            self._append_log("warn", "No supported files", f"{len(paths)} item(s) ignored")
         self._update_empty_state()
         self._refresh_batch_format_combo()
 
@@ -1460,6 +1551,11 @@ class MainWindow(QMainWindow):
             return
 
         output_path = row.resolve_output(self._output_dir)
+        self._append_log(
+            "info",
+            f"Started {row.path.name}",
+            f"{effective_suffix(row.path)} -> {row.target_ext}",
+        )
 
         worker_cls = worker_for(engine)
         # Merge the per-row Enhance-PDF flag into a per-call settings copy
@@ -1505,6 +1601,7 @@ class MainWindow(QMainWindow):
             row.error_log = f"{msg}\n\n{tb_text}\n"
         else:
             row.error_log = f"{msg}\n"
+        self._append_log("error", f"Failed {row.path.name}", msg)
 
     def _record_preflight_failure(
         self, index: int, status_text: str, detail: str
@@ -1519,6 +1616,8 @@ class MainWindow(QMainWindow):
             return
         self._rows[index].error_log = (detail or status_text).strip() + "\n"
         self._set_status(index, status_text)
+        level = "warn" if status_text == "Unsupported" else "error"
+        self._append_log(level, f"{status_text}: {self._rows[index].path.name}", detail)
 
     def _on_worker_finished(self, row: FileRow) -> None:
         self._active_rows.discard(row)
@@ -1533,6 +1632,11 @@ class MainWindow(QMainWindow):
                 # A successful conversion supersedes any prior failure;
                 # don't let a stale log linger on a now-Done row.
                 row.error_log = None
+                self._append_log(
+                    "good",
+                    f"Finished {row.path.name}",
+                    row.completed_output.name,
+                )
             elif status.startswith("Failed"):
                 self._batch_failed += 1
         self._pump_queue()
