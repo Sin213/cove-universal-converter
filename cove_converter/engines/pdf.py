@@ -224,7 +224,13 @@ _STYLE_OR_SCRIPT_BLOCK = re.compile(
 )
 
 
-def _strip_inline_css(html_source: str) -> str:
+def _strip_inline_css(html_source: str | None) -> str:
+    # Defensive: a None here used to surface as a raw ``TypeError`` from
+    # ``re.sub``, which the UI rendered as just "Failed". Convert it into
+    # a user-readable RuntimeError instead. Don't substitute "" — a blank
+    # HTML string would silently produce a blank PDF.
+    if html_source is None:
+        raise RuntimeError("Pandoc produced no HTML output for PDF rendering")
     return _STYLE_OR_SCRIPT_BLOCK.sub("", html_source)
 
 
@@ -254,12 +260,18 @@ def _text_to_minimal_html(text: str) -> str:
 
 
 def _pandoc_to_html(input_path: Path) -> str:
+    # ``-o -`` forces pandoc to emit the rendered HTML to stdout. Without
+    # it, certain Windows builds and frozen-exe configurations have been
+    # observed to swallow stdout, so we'd return None and trip a raw
+    # TypeError downstream in ``_strip_inline_css``. Make the contract
+    # explicit instead.
     cmd = [
         resolve(PANDOC),
         str(input_path),
         "-t", "html5",
         "--standalone",
         "--embed-resources",
+        "-o", "-",
     ]
     result = subprocess.run(
         cmd,
@@ -268,8 +280,12 @@ def _pandoc_to_html(input_path: Path) -> str:
         **_no_window_kwargs(),
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"pandoc exited {result.returncode}")
-    return result.stdout
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(stderr or f"pandoc exited {result.returncode}")
+    stdout = result.stdout
+    if stdout is None or not stdout.strip():
+        raise RuntimeError("Pandoc produced no HTML output for PDF rendering")
+    return stdout
 
 
 def _html_to_pdf(html_source: str, output_path: Path) -> None:
@@ -395,9 +411,6 @@ class PdfWorker(BaseConverterWorker):
             elif in_ext == ".txt":
                 html_source = _text_to_minimal_html(self.input_path.read_text(encoding="utf-8", errors="replace"))
             else:
-                # Use a temp file so pandoc can sniff the format by extension.
-                with tempfile.NamedTemporaryFile(suffix=in_ext, delete=False) as _:
-                    pass  # pandoc reads the real input below
                 html_source = _strip_inline_css(_pandoc_to_html(self.input_path))
             self.progress.emit(60)
             _html_to_pdf(html_source, self.output_path)

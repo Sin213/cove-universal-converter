@@ -22,6 +22,10 @@ class FileRow:
     # Per-row Enhance-PDF toggle. UI surfaces this only when target_ext
     # is ``.pdf``; the engine itself only acts on PDF→PDF.
     enhance_pdf: bool = False
+    # Human-readable failure log captured from the worker. Set when a
+    # row enters a Failed state so the UI can show *why* it failed
+    # without users having to dig through terminal logs.
+    error_log: str | None = None
 
     def resolve_output(self, dest_dir: Path | None) -> Path:
         if self.override_output is not None:
