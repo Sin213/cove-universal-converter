@@ -136,7 +136,7 @@ class BaseConverterWorker(QThread):
     progress = Signal(int)          # 0..100
     status   = Signal(str)          # "Processing" / "Done" / "Failed: …"
     finished_ok = Signal(Path)      # output path on success
-    failed = Signal(str)            # error message
+    failed = Signal(str, str)       # (short error message, full traceback)
 
     def __init__(
         self,
@@ -309,7 +309,7 @@ class BaseConverterWorker(QThread):
                 tb,
             )
             self.status.emit(f"Failed: {exc}")
-            self.failed.emit(str(exc))
+            self.failed.emit(str(exc), tb)
 
     def _cleanup_temp(self) -> None:
         # Only ever unlink paths we created in this run. Never touch a file

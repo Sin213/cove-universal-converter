@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QDragLeaveEvent,
     QDragMoveEvent,
     QDropEvent,
+    QFont,
     QIcon,
     QKeySequence,
     QMouseEvent,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
@@ -44,6 +46,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -1203,6 +1206,10 @@ class MainWindow(QMainWindow):
 
                 menu.addSeparator()
             elif row is not None and (row.status.startswith("Failed") or row.status == "Unsupported"):
+                view_log = QAction("View log", menu)
+                view_log.setEnabled(bool(row.error_log))
+                view_log.triggered.connect(lambda _=False, i=row_idx: self._view_row_log(i))
+                menu.addAction(view_log)
                 copy_err = QAction("Copy error details", menu)
                 copy_err.triggered.connect(lambda _=False, i=row_idx: self._copy_row_error(i))
                 menu.addAction(copy_err)
@@ -1278,13 +1285,27 @@ class MainWindow(QMainWindow):
             # status string lags a fraction behind its presence in pending/active.
             if row in self._pending_rows or row in self._active_rows:
                 continue
+            # Drop any previous worker traceback before this attempt's
+            # outcome is decided — otherwise a preflight failure here
+            # would still surface the prior run's log via "View log".
+            row.error_log = None
             if engine_for(effective_suffix(row.path), row.target_ext) is None:
-                self._set_status(i, "Unsupported")
+                self._record_preflight_failure(
+                    i,
+                    "Unsupported",
+                    f"Unsupported: no engine available to convert "
+                    f"{effective_suffix(row.path)} → {row.target_ext}",
+                )
                 pre_skipped += 1
                 continue
             out = row.resolve_output(self._output_dir)
             if out.resolve() == row.path.resolve():
-                self._set_status(i, "Failed: output would overwrite source")
+                self._record_preflight_failure(
+                    i,
+                    "Failed: output would overwrite source",
+                    "Failed: output would overwrite source — "
+                    "the resolved output path matches the input path.",
+                )
                 pre_failed += 1
                 continue
             eligible.append(row)
@@ -1342,13 +1363,27 @@ class MainWindow(QMainWindow):
         if row.status in ("Queued", "Processing", "Done"):
             return
 
+        # A retry/start hits this path; drop any prior worker traceback
+        # *before* preflight so a stale log can't survive a new attempt.
+        row.error_log = None
+
         if engine_for(effective_suffix(row.path), row.target_ext) is None:
-            self._set_status(index, "Unsupported")
+            self._record_preflight_failure(
+                index,
+                "Unsupported",
+                f"Unsupported: no engine available to convert "
+                f"{effective_suffix(row.path)} → {row.target_ext}",
+            )
             return
 
         out = row.resolve_output(self._output_dir)
         if out.resolve() == row.path.resolve():
-            self._set_status(index, "Failed: output would overwrite source")
+            self._record_preflight_failure(
+                index,
+                "Failed: output would overwrite source",
+                "Failed: output would overwrite source — "
+                "the resolved output path matches the input path.",
+            )
             return
 
         if out.exists():
@@ -1410,9 +1445,18 @@ class MainWindow(QMainWindow):
             index = self._rows.index(row)
         except ValueError:
             return
+        # Drop any prior failure log unconditionally before this attempt's
+        # outcome is decided — covers both the engine-missing branch below
+        # and the worker-creation path that follows.
+        row.error_log = None
         engine = engine_for(effective_suffix(row.path), row.target_ext)
         if engine is None:
-            self._set_status(index, "Unsupported")
+            self._record_preflight_failure(
+                index,
+                "Unsupported",
+                f"Unsupported: no engine available to convert "
+                f"{effective_suffix(row.path)} → {row.target_ext}",
+            )
             return
 
         output_path = row.resolve_output(self._output_dir)
@@ -1429,6 +1473,9 @@ class MainWindow(QMainWindow):
         # conversion can shift indices but the row identity stays stable.
         worker.progress.connect(lambda pct, rr=row: self._on_worker_progress(rr, pct))
         worker.status.connect(lambda text, rr=row: self._on_worker_status(rr, text))
+        worker.failed.connect(
+            lambda msg, tb, rr=row: self._on_worker_failed(rr, msg, tb)
+        )
         worker.finished.connect(lambda rr=row: self._on_worker_finished(rr))
         self._active_rows.add(row)
         worker.start()
@@ -1447,6 +1494,32 @@ class MainWindow(QMainWindow):
             return
         self._set_status(index, text)
 
+    def _on_worker_failed(self, row: FileRow, message: str, tb: str) -> None:
+        # Persist the worker's exception message + traceback on the row
+        # so the user-facing "View log" action has something real to
+        # show. Status text itself is left to the existing ``status``
+        # signal — this handler only stores the detail.
+        msg = (message or "").strip() or "conversion failed"
+        tb_text = (tb or "").strip()
+        if tb_text:
+            row.error_log = f"{msg}\n\n{tb_text}\n"
+        else:
+            row.error_log = f"{msg}\n"
+
+    def _record_preflight_failure(
+        self, index: int, status_text: str, detail: str
+    ) -> None:
+        # Preflight rejections (unsupported target, would-overwrite-source,
+        # etc.) happen before any worker exists, so the worker's
+        # ``failed`` signal never fires for them. Without this, "View log"
+        # on a re-attempt would still show the prior worker traceback.
+        # Replace ``error_log`` with the *current* preflight reason so the
+        # log accurately reflects this attempt.
+        if not (0 <= index < len(self._rows)):
+            return
+        self._rows[index].error_log = (detail or status_text).strip() + "\n"
+        self._set_status(index, status_text)
+
     def _on_worker_finished(self, row: FileRow) -> None:
         self._active_rows.discard(row)
         # Row may have been removed (e.g. via Clear All) before the worker
@@ -1457,6 +1530,9 @@ class MainWindow(QMainWindow):
             if status == "Done":
                 self._batch_done += 1
                 row.completed_output = row.resolve_output(self._output_dir)
+                # A successful conversion supersedes any prior failure;
+                # don't let a stale log linger on a now-Done row.
+                row.error_log = None
             elif status.startswith("Failed"):
                 self._batch_failed += 1
         self._pump_queue()
@@ -1539,9 +1615,48 @@ class MainWindow(QMainWindow):
     def _copy_row_error(self, index: int) -> None:
         if not (0 <= index < len(self._rows)):
             return
-        text = self._rows[index].status
+        row = self._rows[index]
+        text = row.error_log or row.status
         QApplication.clipboard().setText(text)
         self._toast.show_message("Error details copied")
+
+    def _view_row_log(self, index: int) -> None:
+        if not (0 <= index < len(self._rows)):
+            return
+        row = self._rows[index]
+        log_text = row.error_log or row.status or "No log captured."
+        self._show_log_dialog(row.path.name, log_text)
+
+    def _show_log_dialog(self, title: str, log_text: str) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Conversion log — {title}")
+        dlg.resize(720, 420)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        view = QPlainTextEdit(dlg)
+        view.setReadOnly(True)
+        view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        font = QFont("monospace")
+        font.setStyleHint(QFont.TypeWriter)
+        view.setFont(font)
+        view.setPlainText(log_text)
+        layout.addWidget(view, 1)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        copy_btn = QPushButton("Copy", dlg)
+        copy_btn.clicked.connect(
+            lambda: (
+                QApplication.clipboard().setText(log_text),
+                self._toast.show_message("Log copied"),
+            )
+        )
+        close_btn = QPushButton("Close", dlg)
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        dlg.exec()
 
     # =========================================================
     # Row status / tinting
