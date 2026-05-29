@@ -1,7 +1,8 @@
 """Conversion-quality settings shared across workers.
 
-Plain dataclass; lives for the app's lifetime on the MainWindow. No disk
-persistence yet — add QSettings later if the user wants it.
+Plain dataclass; lives for the app's lifetime on the MainWindow. Quality
+settings are persisted to QSettings("Cove", "UniversalConverter") under the
+"quality/" key group so they survive app restarts.
 
 When ``use_custom_quality`` is False (the default) the ``effective_*`` methods
 return near-lossless values that prioritise source fidelity over file size —
@@ -11,6 +12,8 @@ sliders before they take effect.
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from PySide6.QtCore import QSettings
 
 
 VIDEO_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast",
@@ -23,6 +26,10 @@ _DEFAULT_VIDEO_PRESET = "slow"
 _DEFAULT_AUDIO_KBPS   = 320
 _DEFAULT_JPEG_QUALITY = 95
 _DEFAULT_WEBP_QUALITY = 95
+
+_SETTINGS_ORG = "Cove"
+_SETTINGS_APP = "UniversalConverter"
+_GROUP       = "quality"
 
 
 @dataclass
@@ -58,6 +65,40 @@ class ConversionSettings:
 
     def effective_webp_quality(self) -> int:
         return self.webp_quality if self.use_custom_quality else _DEFAULT_WEBP_QUALITY
+
+    def save(self) -> None:
+        """Persist quality settings to QSettings."""
+        qs = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        qs.beginGroup(_GROUP)
+        qs.setValue("use_custom_quality", self.use_custom_quality)
+        qs.setValue("video_crf", self.video_crf)
+        qs.setValue("video_preset", self.video_preset)
+        qs.setValue("audio_bitrate_kbps", self.audio_bitrate_kbps)
+        qs.setValue("jpeg_quality", self.jpeg_quality)
+        qs.setValue("webp_quality", self.webp_quality)
+        qs.setValue("max_concurrent", self.max_concurrent)
+        qs.endGroup()
+
+
+def load_settings() -> ConversionSettings:
+    """Load quality settings from QSettings, falling back to defaults."""
+    defaults = ConversionSettings()
+    qs = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    qs.beginGroup(_GROUP)
+    s = ConversionSettings(
+        use_custom_quality=bool(qs.value("use_custom_quality", defaults.use_custom_quality)),
+        video_crf=int(qs.value("video_crf", defaults.video_crf)),
+        video_preset=str(qs.value("video_preset", defaults.video_preset)),
+        audio_bitrate_kbps=int(qs.value("audio_bitrate_kbps", defaults.audio_bitrate_kbps)),
+        jpeg_quality=int(qs.value("jpeg_quality", defaults.jpeg_quality)),
+        webp_quality=int(qs.value("webp_quality", defaults.webp_quality)),
+        max_concurrent=int(qs.value("max_concurrent", defaults.max_concurrent)),
+    )
+    qs.endGroup()
+    # Clamp video_preset to valid values in case stored value is stale.
+    if s.video_preset not in VIDEO_PRESETS:
+        s.video_preset = defaults.video_preset
+    return s
 
 
 def default_settings() -> ConversionSettings:

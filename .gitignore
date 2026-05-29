@@ -30,3 +30,10 @@ CLAUDE.md
 WORKFLOW.md
 RELEASES.md
 .run.sh
+AGENTS.md
+.claudeignore
+
+.codex-reviews/
+
+# Session aids (orientation snapshots)
+*-orientation.md

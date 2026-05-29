@@ -68,7 +68,7 @@ from cove_converter.routing import (
     info_for,
     targets_for,
 )
-from cove_converter.settings import ConversionSettings, default_settings
+from cove_converter.settings import ConversionSettings, default_settings, load_settings
 from cove_converter.ui.drop_zone import DropZone
 from cove_converter.ui.file_row import FileRow, unique_path
 from cove_converter.ui.formats_dialog import FormatsDialog
@@ -599,7 +599,7 @@ class MainWindow(QMainWindow):
         self._rows: list[FileRow] = []
         self._row_widgets: list[dict] = []  # parallel list of cell widgets
         self._output_dir: Path | None = None
-        self._settings: ConversionSettings = default_settings()
+        self._settings: ConversionSettings = load_settings()
 
         # Tracked by row identity (not index) so Clear Failed during an
         # in-flight conversion can't shift indices out from under live
@@ -1037,6 +1037,7 @@ class MainWindow(QMainWindow):
         dialog = QualityDialog(self._settings, self)
         if dialog.exec():
             self._settings = dialog.result_settings()
+            self._settings.save()
             self._toast.show_message("Quality settings saved")
 
     def _browse_output_dir(self) -> None:

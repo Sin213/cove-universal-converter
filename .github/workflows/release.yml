@@ -30,8 +30,25 @@ jobs:
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" 2>/dev/null || pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
   build-linux:
-    needs: resolve-version
+    needs: [resolve-version, test]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.resolve-version.outputs.version }}
@@ -87,7 +104,7 @@ jobs:
           fail_on_unmatched_files: true
 
   build-windows:
-    needs: resolve-version
+    needs: [resolve-version, test]
     runs-on: windows-latest
     env:
       VERSION: ${{ needs.resolve-version.outputs.version }}
