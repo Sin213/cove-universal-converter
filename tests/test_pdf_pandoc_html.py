@@ -56,7 +56,13 @@ def _fake_completed(stdout: str | None, *, returncode: int = 0, stderr: str = ""
     return fake
 
 
+def _mock_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub ``resolve()`` so tests don't need pandoc installed."""
+    monkeypatch.setattr(pdf_engine, "resolve", lambda _name: "pandoc")
+
+
 def test_pandoc_to_html_raises_when_stdout_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_resolve(monkeypatch)
     captured: dict[str, list[str]] = {}
 
     def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
@@ -68,12 +74,12 @@ def test_pandoc_to_html_raises_when_stdout_is_none(monkeypatch: pytest.MonkeyPat
     with pytest.raises(RuntimeError) as excinfo:
         _pandoc_to_html(Path("/nonexistent/sample.epub"))
     assert "no HTML output" in str(excinfo.value)
-    # Contract: pandoc must be told to write HTML to stdout explicitly.
     assert "-o" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("-o") + 1] == "-"
 
 
 def test_pandoc_to_html_raises_when_stdout_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_resolve(monkeypatch)
     monkeypatch.setattr(
         pdf_engine.subprocess, "run", lambda *a, **k: _fake_completed("   \n\n  ", returncode=0)
     )
@@ -83,6 +89,7 @@ def test_pandoc_to_html_raises_when_stdout_blank(monkeypatch: pytest.MonkeyPatch
 
 
 def test_pandoc_to_html_propagates_stderr_on_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_resolve(monkeypatch)
     monkeypatch.setattr(
         pdf_engine.subprocess, "run",
         lambda *a, **k: _fake_completed("", returncode=2, stderr="bad input file"),
@@ -93,6 +100,7 @@ def test_pandoc_to_html_propagates_stderr_on_nonzero(monkeypatch: pytest.MonkeyP
 
 
 def test_pandoc_to_html_returns_string_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_resolve(monkeypatch)
     monkeypatch.setattr(
         pdf_engine.subprocess, "run",
         lambda *a, **k: _fake_completed("<html><body>hi</body></html>", returncode=0),
