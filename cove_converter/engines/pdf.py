@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Callable
 
@@ -328,6 +329,69 @@ def _text_to_doc(text: str, output_path: Path) -> None:
         temp_md.unlink(missing_ok=True)
 
 
+def _pdf_to_cbz(
+    src: Path,
+    dst: Path,
+    *,
+    dpi: int = 150,
+    progress: Callable[[int], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> None:
+    """Render every page of ``src`` to PNG and pack them into a CBZ (ZIP) at ``dst``."""
+    import io
+
+    import pypdfium2 as pdfium
+
+    if progress:
+        progress(5)
+
+    try:
+        pdf = pdfium.PdfDocument(str(src))
+    except pdfium.PdfiumError as exc:
+        msg = str(exc).lower()
+        if "password" in msg or "encrypted" in msg:
+            raise RuntimeError(
+                "PDF is password-protected — please unlock it first"
+            ) from exc
+        raise RuntimeError(f"Could not open PDF: {exc}") from exc
+
+    n = len(pdf)
+    if n == 0:
+        pdf.close()
+        raise RuntimeError("PDF contains no pages")
+
+    try:
+        scale = dpi / 72.0
+        with zipfile.ZipFile(dst, "w", zipfile.ZIP_STORED) as zf:
+            pad = len(str(n))
+            for i in range(n):
+                if cancelled and cancelled():
+                    return
+                page = pdf[i]
+                bitmap = page.render(scale=scale)
+                try:
+                    pil = bitmap.to_pil()
+                finally:
+                    bitmap.close()
+                page.close()
+
+                buf = io.BytesIO()
+                pil.save(buf, "PNG")
+                pil.close()
+                del pil
+
+                zf.writestr(f"{str(i + 1).zfill(pad)}.png", buf.getvalue())
+                buf.close()
+
+                if progress:
+                    progress(5 + int(90 * (i + 1) / n))
+    finally:
+        pdf.close()
+
+    if progress:
+        progress(95)
+
+
 class PdfWorker(BaseConverterWorker):
     def _convert(self) -> None:
         in_ext  = self.input_path.suffix.lower()
@@ -378,6 +442,15 @@ class PdfWorker(BaseConverterWorker):
                 self.progress.emit(5)
                 shutil.copyfile(self.input_path, self.output_path)
                 self.progress.emit(95)
+            return
+
+        if in_ext == ".pdf" and out_ext == ".cbz":
+            _pdf_to_cbz(
+                self.input_path,
+                self.output_path,
+                progress=self.progress.emit,
+                cancelled=lambda: self._cancel,
+            )
             return
 
         if in_ext == ".pdf":

@@ -77,7 +77,7 @@ SUPPORTED_FORMATS: dict[str, FormatInfo] = {
     # ``.pdf`` is the first target so PDF inputs default to PDF→PDF, which
     # is the smart-PDF flattening / scan-enhance / byte-identical copy path.
     # The doc targets stay available for users who want PDF→DOCX/etc.
-    ".pdf":  FormatInfo("Pdf",    (".pdf", ".docx", ".odt", ".rtf", ".epub", ".md", ".html", ".txt")),
+    ".pdf":  FormatInfo("Pdf",    (".pdf", ".cbz", ".docx", ".odt", ".rtf", ".epub", ".md", ".html", ".txt")),
     ".docx": FormatInfo("Pandoc", _DOC_TARGETS),
     ".odt":  FormatInfo("Pandoc", _DOC_TARGETS),
     ".rtf":  FormatInfo("Pandoc", _DOC_TARGETS),
@@ -190,6 +190,7 @@ FORMAT_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
                       ".ico", ".heic", ".heif")),
     ("Documents",    (".pdf", ".docx", ".odt", ".rtf", ".epub", ".md",
                       ".html", ".htm", ".txt", ".tex")),
+    ("Comics",       (".cbz",)),
     ("Subtitles",    (".srt", ".vtt")),
     ("Spreadsheets", (".csv", ".xlsx")),
     ("Archives",     (".zip", ".tar", ".tgz", ".tar.gz")),
