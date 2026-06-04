@@ -28,6 +28,7 @@ class PandocWorker(BaseConverterWorker):
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             **_no_window_kwargs(),
         )
         if result.returncode != 0:

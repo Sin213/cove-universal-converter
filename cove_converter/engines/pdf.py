@@ -278,6 +278,7 @@ def _pandoc_to_html(input_path: Path) -> str:
         cmd,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         **_no_window_kwargs(),
     )
     if result.returncode != 0:
@@ -319,6 +320,7 @@ def _text_to_doc(text: str, output_path: Path) -> None:
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             **_no_window_kwargs(),
         )
         if result.returncode != 0:

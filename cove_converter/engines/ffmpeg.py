@@ -121,6 +121,7 @@ class FFmpegWorker(BaseConverterWorker):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             bufsize=1,
             **_no_window_kwargs(),
         )
