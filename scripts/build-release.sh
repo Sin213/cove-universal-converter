@@ -32,46 +32,24 @@ APPIMAGETOOL="${LOCAL_BIN}/appimagetool"
 # Pandoc release version to bundle.
 PANDOC_VERSION="3.1.13"
 
-# FFmpeg static-build asset to bundle. johnvansickle.com only publishes a
-# single rolling release URL:
-#   https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-# That URL is mutable — every time upstream cuts a new build, the bytes
-# behind it change. There is no per-version path. To stay fail-closed we
-# pin FFMPEG_SHA256 against the exact bytes we expect; a mismatch aborts
-# the build before anything is extracted into the AppImage / .deb.
+# FFmpeg static-build sources. Primary: BtbN/FFmpeg-Builds on GitHub
+# (immutable per-tag URLs, reliable infrastructure). Fallback:
+# johnvansickle.com (mutable rolling URL, single-server hosting).
 #
-# MAINTAINER NOTE: when CI starts failing the SHA-256 check, upstream has
-# rotated the release. Download the new tarball, run ``sha256sum`` on it,
-# verify it against johnvansickle.com's published hash, then bump
-# FFMPEG_VERSION (informational only) and FFMPEG_SHA256 here in the same
-# commit. Do NOT remove the verification step.
-FFMPEG_VERSION="${FFMPEG_VERSION:-7.0.2}"
-FFMPEG_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+# Each source has its own pinned SHA-256. A mismatch aborts the build
+# before anything is extracted into the AppImage / .deb.
+#
+# MAINTAINER NOTE: to bump ffmpeg, pick a new BtbN autobuild tag from
+# https://github.com/BtbN/FFmpeg-Builds/releases, download the
+# linux64-gpl asset, run ``sha256sum`` on it, and update the URL + hash.
+FFMPEG_VERSION="${FFMPEG_VERSION:-7.1.4}"
+FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-04-14-00/ffmpeg-n7.1.4-9-gc06af95f12-linux64-gpl-7.1.tar.xz"
+FFMPEG_SHA256="${FFMPEG_SHA256:-a7ffb6b18ebd414a7992777eb68dae6580c8ca7d2329a1c308e466eaf98ff989}"
 
-# Pinned SHA-256 digests for the upstream archives we bundle. A mismatch
-# here aborts the build before any downloaded bytes are extracted into the
-# AppImage / .deb. Regenerate with `sha256sum <file>` after upstream
-# rotates the asset, verify against the upstream signature/hash, and
-# commit the new digest alongside the version bump.
-FFMPEG_SHA256="${FFMPEG_SHA256:-abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67}"
+FFMPEG_FALLBACK_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+FFMPEG_FALLBACK_SHA256="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
+
 PANDOC_SHA256="db556c98cf207d2fddc088d12d2e2f367d9401784d4a3e914b068fa895dcf3f0"
-
-if [ -z "$FFMPEG_SHA256" ]; then
-    cat >&2 <<'EOF'
-ERROR: Linux release builds require a pinned FFmpeg SHA-256.
-
-       Set FFMPEG_SHA256 (either at the top of scripts/build-release.sh
-       or as an environment variable) to the digest of the current
-       johnvansickle.com release asset:
-
-           ffmpeg-release-amd64-static.tar.xz
-
-       That URL is mutable — upstream rotates it on every new build — so
-       the digest must be refreshed in lockstep. Fail closed rather than
-       silently bundle a different ffmpeg than the one that was reviewed.
-EOF
-    exit 1
-fi
 
 mkdir -p "$RELEASE_DIR" "$LOCAL_BIN"
 rm -rf "$DIST_DIR" "$ROOT/build"
@@ -92,11 +70,17 @@ python3 -m venv "$BUILD_ENV"
 echo "==> Fetching ffmpeg static build (expecting $FFMPEG_VERSION)"
 FF_TMP="$ROOT/build/ff"
 mkdir -p "$FF_TMP"
-curl -fL --retry 3 --silent --show-error \
-    -o "$FF_TMP/ffmpeg.tar.xz" \
-    "$FFMPEG_URL"
+FF_ARCHIVE="$FF_TMP/ffmpeg.tar.xz"
+FF_ACTIVE_SHA256="$FFMPEG_SHA256"
+if ! curl -fL --retry 3 --connect-timeout 30 --silent --show-error \
+    -o "$FF_ARCHIVE" "$FFMPEG_URL"; then
+    echo "==> Primary mirror failed, trying fallback (johnvansickle.com)"
+    FF_ACTIVE_SHA256="$FFMPEG_FALLBACK_SHA256"
+    curl -fL --retry 3 --connect-timeout 30 --silent --show-error \
+        -o "$FF_ARCHIVE" "$FFMPEG_FALLBACK_URL"
+fi
 echo "==> Verifying ffmpeg archive against pinned SHA-256"
-echo "$FFMPEG_SHA256  $FF_TMP/ffmpeg.tar.xz" | sha256sum -c -
+echo "$FF_ACTIVE_SHA256  $FF_ARCHIVE" | sha256sum -c -
 (cd "$FF_TMP" && tar -xf ffmpeg.tar.xz)
 FFMPEG_BIN="$(find "$FF_TMP" -type f -name ffmpeg | head -1)"
 [ -n "$FFMPEG_BIN" ] || { echo "ffmpeg not found after extract"; exit 1; }
