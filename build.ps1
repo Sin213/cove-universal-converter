@@ -120,12 +120,12 @@ $commonArgs = @(
     '--icon', 'cove_icon.ico',
     '--paths', '.',
     '--add-data', ("cove_icon.png" + [IO.Path]::PathSeparator + "."),
-    '--hidden-import', 'xhtml2pdf',
-    '--hidden-import', 'reportlab',
+    '--collect-all', 'xhtml2pdf',
+    '--collect-all', 'reportlab',
+    '--collect-all', 'html5lib',
+    '--collect-all', 'svglib',
     '--hidden-import', 'pillow_heif',
     '--hidden-import', 'pypdf',
-    '--hidden-import', 'pypdfium2',
-    '--hidden-import', 'pypdfium2_raw',
     '--collect-all', 'pypdfium2',
     '--hidden-import', 'openpyxl',
     '--hidden-import', 'yaml',
@@ -164,12 +164,12 @@ $portableName = "$App-portable"
     --icon cove_icon.ico `
     --paths . `
     --add-data ("cove_icon.png" + [IO.Path]::PathSeparator + ".") `
-    --hidden-import xhtml2pdf `
-    --hidden-import reportlab `
+    --collect-all xhtml2pdf `
+    --collect-all reportlab `
+    --collect-all html5lib `
+    --collect-all svglib `
     --hidden-import pillow_heif `
     --hidden-import pypdf `
-    --hidden-import pypdfium2 `
-    --hidden-import pypdfium2_raw `
     --collect-all pypdfium2 `
     --hidden-import openpyxl `
     --hidden-import yaml `
