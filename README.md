@@ -9,7 +9,7 @@ One codebase, one repository, two native builds: a Windows `.exe` and a Linux
 binary. Everything below assumes you're starting from a fresh clone:
 
 ```
-git clone <your-repo-url>
+git clone https://github.com/Sin213/cove-universal-converter.git
 cd cove-universal-converter
 ```
 
