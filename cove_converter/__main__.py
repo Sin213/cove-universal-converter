@@ -19,6 +19,9 @@ def _log_dir() -> Path:
     standard place) and falls back to ``~/.cache``. The directory is created
     lazily — failing to create it must not abort app startup, so we swallow
     any OSError and fall back to a temp dir."""
+    from cove_converter.portable import is_portable, portable_data_dir
+    if is_portable():
+        return Path(portable_data_dir("cove-universal-converter"))
     base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
     return Path(base) / "cove-universal-converter"
 
