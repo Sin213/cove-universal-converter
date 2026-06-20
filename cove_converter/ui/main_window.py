@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizeGrip,
     QSizePolicy,
     QTableWidget,
     QToolButton,
@@ -588,6 +589,11 @@ class MainWindow(QMainWindow):
         # Frameless + transparent so the rounded chrome shows.
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Visible SE-corner resize grip so the user has a discoverable
+        # affordance. startSystemResize() at the edge still works.
+        self._size_grip = QSizeGrip(self)
+        self._size_grip.setFixedSize(16, 16)
+        self._size_grip.raise_()
         self.setMouseTracking(True)
 
         icon_file = resource_path("cove_icon.png")
@@ -699,6 +705,13 @@ class MainWindow(QMainWindow):
     # =========================================================
     # Theme integration
     # =========================================================
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # Reposition the SE-corner QSizeGrip on every resize so it stays
+        # pinned to the bottom-right of the window.
+        s = self._size_grip.sizeHint()
+        self._size_grip.move(self.width() - s.width(), self.height() - s.height())
 
     def _set_btn_icon(self, btn, svg: bytes, size: int, token: str) -> None:
         """Set ``btn``'s icon from ``svg`` painted with ``theme_color(token)``

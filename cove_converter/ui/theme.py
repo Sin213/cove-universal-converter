@@ -49,6 +49,7 @@ _DARK = {
     "surface_3":      "#1f1f2b",
     "border":         "rgba(255, 255, 255, 0.06)",
     "border_strong":  "rgba(255, 255, 255, 0.10)",
+    "window_edge":    "rgba(255, 255, 255, 0.18)",
     "text":           "#ececf1",
     "text_strong":    "#ffffff",
     "text_dim":       "#9a9aae",
@@ -188,6 +189,7 @@ def _stylesheet(theme: str) -> str:
     SURFACE_3     = p["surface_3"]
     BORDER        = p["border"]
     BORDER_STRONG = p["border_strong"]
+    WINDOW_EDGE   = p["window_edge"]
     TEXT          = p["text"]
     TEXT_STRONG   = p["text_strong"]
     TEXT_DIM      = p["text_dim"]
@@ -216,6 +218,12 @@ QToolTip {{ color: {TEXT}; background: {ELEVATED}; border: 1px solid {BORDER_STR
     background: {BG};
     border: 1px solid {BORDER};
     border-radius: 14px;
+}}
+/* Outer window edge - visible 1px line so the OS window is perceivable
+   against any wallpaper. Painted on QMainWindow (not the rounded chromeRoot)
+   so it follows the OS rectangular window shape. */
+QMainWindow {{
+    border: 4px solid {WINDOW_EDGE};
 }}
 #chromeContent {{ background: transparent; }}
 
