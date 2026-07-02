@@ -13,12 +13,10 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
-    QUrl,
     Signal,
 )
 from PySide6.QtGui import (
     QAction,
-    QDesktopServices,
     QDragEnterEvent,
     QDragLeaveEvent,
     QDragMoveEvent,
@@ -60,6 +58,7 @@ from PySide6.QtWidgets import (
 
 from cove_converter import __version__, updater
 from cove_converter.binaries import resource_path
+from cove_converter.system_open import open_local
 from cove_converter.engines import worker_for
 from cove_converter.routing import (
     SUPPORTED_FORMATS,
@@ -1704,14 +1703,14 @@ class MainWindow(QMainWindow):
         if folder is None:
             self._toast.show_message("No output folder yet", "warn")
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        open_local(str(folder))
 
     def _open_last_file(self) -> None:
         last = self._last_output_file()
         if last is None or not last.exists():
             self._toast.show_message("Converted file not found", "warn")
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(last)))
+        open_local(str(last))
 
     def _open_row_file(self, index: int) -> None:
         if not (0 <= index < len(self._rows)):
@@ -1721,14 +1720,14 @@ class MainWindow(QMainWindow):
         if not out.exists():
             self._toast.show_message("Converted file not found", "warn")
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
+        open_local(str(out))
 
     def _show_row_in_folder(self, index: int) -> None:
         if not (0 <= index < len(self._rows)):
             return
         row = self._rows[index]
         out = row.completed_output or row.resolve_output(self._output_dir)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(out.parent)))
+        open_local(str(out.parent))
 
     def _copy_row_error(self, index: int) -> None:
         if not (0 <= index < len(self._rows)):
