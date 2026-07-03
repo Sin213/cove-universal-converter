@@ -82,6 +82,7 @@ _LIGHT = {
     "surface_3":      "#e3e6ec",
     "border":         "rgba(0, 0, 0, 0.07)",
     "border_strong":  "rgba(0, 0, 0, 0.13)",
+    "window_edge":    "rgba(0, 0, 0, 0.22)",
     "text":           "#1a1c25",
     "text_strong":    "#0a0c12",
     "text_dim":       "#5a5e72",
