@@ -575,7 +575,7 @@ class _Toast(QFrame):
 
 
 # Width of resize-grip border around the frameless window.
-_RESIZE_MARGIN = 6
+_RESIZE_MARGIN = 8
 
 
 class MainWindow(QMainWindow):
