@@ -281,15 +281,29 @@ class DownloadWorker(QObject):
 
 
 def swap_in_appimage(new_path: Path) -> Path:
-    """Replace the running AppImage with `new_path`, leave it executable, and
-    return its final path."""
+    """Install `new_path` next to the running AppImage under its own
+    versioned filename, remove the old file, and return the new path.
+
+    Keeping the release asset's filename (instead of overwriting the old
+    file in place) matches electron-updater semantics and keeps the
+    on-disk name truthful - external launchers like Cove Nexus derive the
+    installed version from it."""
     current = os.environ.get("APPIMAGE")
     if not current:
-        raise RuntimeError("APPIMAGE env var not set — not an AppImage install")
-    target = Path(current).resolve()
-    shutil.move(str(new_path), str(target))
-    mode = os.stat(target).st_mode
-    os.chmod(target, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        raise RuntimeError("APPIMAGE env var not set - not an AppImage install")
+    old = Path(current).resolve()
+    target = old.parent / new_path.name
+    tmp = target.with_name(target.name + ".part")
+    shutil.move(str(new_path), str(tmp))
+    mode = os.stat(tmp).st_mode
+    os.chmod(tmp, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    os.replace(tmp, target)
+    if target != old:
+        try:
+            old.unlink()  # unlinking the running file is fine on Linux
+        except OSError:
+            pass
+    os.environ["APPIMAGE"] = str(target)
     return target
 
 
