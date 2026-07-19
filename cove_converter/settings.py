@@ -80,6 +80,18 @@ class ConversionSettings:
         qs.endGroup()
 
 
+def _stored_int(qs: QSettings, key: str, default: int, lo: int, hi: int) -> int:
+    """Read a persisted int, surviving hand-edited / corrupted conf values.
+
+    A non-numeric or missing value falls back to ``default`` instead of
+    crashing the app at startup; out-of-range values are clamped."""
+    try:
+        value = int(qs.value(key, default))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
+
+
 def load_settings() -> ConversionSettings:
     """Load quality settings from QSettings, falling back to defaults."""
     defaults = ConversionSettings()
@@ -87,12 +99,13 @@ def load_settings() -> ConversionSettings:
     qs.beginGroup(_GROUP)
     s = ConversionSettings(
         use_custom_quality=bool(qs.value("use_custom_quality", defaults.use_custom_quality)),
-        video_crf=int(qs.value("video_crf", defaults.video_crf)),
+        video_crf=_stored_int(qs, "video_crf", defaults.video_crf, 0, 51),
         video_preset=str(qs.value("video_preset", defaults.video_preset)),
-        audio_bitrate_kbps=int(qs.value("audio_bitrate_kbps", defaults.audio_bitrate_kbps)),
-        jpeg_quality=int(qs.value("jpeg_quality", defaults.jpeg_quality)),
-        webp_quality=int(qs.value("webp_quality", defaults.webp_quality)),
-        max_concurrent=int(qs.value("max_concurrent", defaults.max_concurrent)),
+        audio_bitrate_kbps=_stored_int(
+            qs, "audio_bitrate_kbps", defaults.audio_bitrate_kbps, 32, 512),
+        jpeg_quality=_stored_int(qs, "jpeg_quality", defaults.jpeg_quality, 1, 100),
+        webp_quality=_stored_int(qs, "webp_quality", defaults.webp_quality, 1, 100),
+        max_concurrent=_stored_int(qs, "max_concurrent", defaults.max_concurrent, 1, 16),
     )
     qs.endGroup()
     # Clamp video_preset to valid values in case stored value is stale.

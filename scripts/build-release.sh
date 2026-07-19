@@ -42,9 +42,17 @@ PANDOC_VERSION="3.1.13"
 # MAINTAINER NOTE: to bump ffmpeg, pick a new BtbN autobuild tag from
 # https://github.com/BtbN/FFmpeg-Builds/releases, download the
 # linux64-gpl asset, run ``sha256sum`` on it, and update the URL + hash.
-FFMPEG_VERSION="${FFMPEG_VERSION:-7.1.4}"
-FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-04-14-00/ffmpeg-n7.1.4-9-gc06af95f12-linux64-gpl-7.1.tar.xz"
+_FFMPEG_DEFAULT_VERSION="7.1.4"
+_FFMPEG_DEFAULT_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-04-14-00/ffmpeg-n7.1.4-9-gc06af95f12-linux64-gpl-7.1.tar.xz"
+FFMPEG_VERSION="${FFMPEG_VERSION:-$_FFMPEG_DEFAULT_VERSION}"
+FFMPEG_URL="${FFMPEG_URL:-$_FFMPEG_DEFAULT_URL}"
 FFMPEG_SHA256="${FFMPEG_SHA256:-a7ffb6b18ebd414a7992777eb68dae6580c8ca7d2329a1c308e466eaf98ff989}"
+# An FFMPEG_VERSION override without a matching URL+hash would log one
+# version while downloading and hash-verifying another.
+if [ "$FFMPEG_VERSION" != "$_FFMPEG_DEFAULT_VERSION" ] && [ "$FFMPEG_URL" = "$_FFMPEG_DEFAULT_URL" ]; then
+    echo "ERROR: FFMPEG_VERSION=$FFMPEG_VERSION overridden but FFMPEG_URL/FFMPEG_SHA256 still point at $_FFMPEG_DEFAULT_VERSION; override all three together." >&2
+    exit 1
+fi
 
 FFMPEG_FALLBACK_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
 FFMPEG_FALLBACK_SHA256="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
@@ -174,15 +182,31 @@ exec "\$HERE/$APP_NAME" "\$@"
 EOF
 chmod +x "$APPDIR/usr/bin/$APP_NAME"
 
-if [ ! -x "$APPIMAGETOOL" ]; then
-    if command -v appimagetool >/dev/null 2>&1; then
-        APPIMAGETOOL="$(command -v appimagetool)"
-    else
-        echo "==> Downloading appimagetool to $APPIMAGETOOL"
-        curl -fL --retry 3 --silent --show-error -o "$APPIMAGETOOL" \
-            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
-        chmod +x "$APPIMAGETOOL"
+# appimagetool is hash-pinned like ffmpeg/pandoc: the 'continuous' tag is
+# mutable, and a stale cached copy or arbitrary PATH tool would bypass the
+# pin, so EVERY path is verified. Set APPIMAGETOOL_ALLOW_SYSTEM=1 to
+# explicitly trust an unverified system appimagetool instead.
+# MAINTAINER NOTE: on upstream rebuilds, re-download, sha256sum, and
+# update APPIMAGETOOL_SHA256.
+APPIMAGETOOL_SHA256="${APPIMAGETOOL_SHA256:-a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0}"
+appimagetool_hash_ok() {
+    [ -f "$1" ] && [ "$(sha256sum "$1" | awk '{print $1}')" = "$APPIMAGETOOL_SHA256" ]
+}
+if appimagetool_hash_ok "$APPIMAGETOOL"; then
+    chmod +x "$APPIMAGETOOL"
+elif [ "${APPIMAGETOOL_ALLOW_SYSTEM:-0}" = "1" ] && command -v appimagetool >/dev/null 2>&1; then
+    APPIMAGETOOL="$(command -v appimagetool)"
+    echo "==> Using UNVERIFIED system appimagetool at $APPIMAGETOOL (APPIMAGETOOL_ALLOW_SYSTEM=1)"
+else
+    echo "==> Downloading appimagetool to $APPIMAGETOOL"
+    curl -fL --retry 3 --silent --show-error -o "$APPIMAGETOOL" \
+        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+    if ! appimagetool_hash_ok "$APPIMAGETOOL"; then
+        echo "ERROR: appimagetool sha256 mismatch (expected $APPIMAGETOOL_SHA256)" >&2
+        rm -f "$APPIMAGETOOL"
+        exit 1
     fi
+    chmod +x "$APPIMAGETOOL"
 fi
 
 echo "==> Building AppImage"

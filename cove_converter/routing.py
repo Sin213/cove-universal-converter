@@ -97,8 +97,8 @@ SUPPORTED_FORMATS: dict[str, FormatInfo] = {
     ".xlsx": FormatInfo("Spreadsheet", (".csv",)),
 
     # ---- Archives (extract + repack via stdlib zipfile / tarfile) ----
-    ".zip":    FormatInfo("Archive", (".tar", ".tgz")),
-    ".tar":    FormatInfo("Archive", (".zip", ".tgz")),
+    ".zip":    FormatInfo("Archive", (".tar", ".tgz", ".tar.gz")),
+    ".tar":    FormatInfo("Archive", (".zip", ".tgz", ".tar.gz")),
     ".tgz":    FormatInfo("Archive", (".zip", ".tar")),
     # ``.tar.gz`` is a compound suffix; ``Path.suffix`` returns just ``.gz``
     # so callers must use ``effective_suffix`` to look it up. Plain ``.gz``
@@ -175,7 +175,9 @@ def effective_stem(path: Path) -> str:
     """
     ext = effective_suffix(path)
     if ext in _COMPOUND_SUFFIXES:
-        return path.name[: -len(ext)]
+        # A file literally named ``.tar.gz`` has an empty stem; without the
+        # fallback the output would be a hidden file named just ``.zip``.
+        return path.name[: -len(ext)] or "output"
     return path.stem
 
 
@@ -190,7 +192,9 @@ FORMAT_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
                       ".ico", ".heic", ".heif")),
     ("Documents",    (".pdf", ".docx", ".odt", ".rtf", ".epub", ".md",
                       ".html", ".htm", ".txt", ".tex")),
-    ("Comics",       (".cbz",)),
+    # No Comics row: ``.cbz`` is an output target (PDF → CBZ) only, and this
+    # dialog advertises *input* formats — listing it made dropped .cbz files
+    # look like a bug when they were silently skipped.
     ("Subtitles",    (".srt", ".vtt")),
     ("Spreadsheets", (".csv", ".xlsx")),
     ("Archives",     (".zip", ".tar", ".tgz", ".tar.gz")),

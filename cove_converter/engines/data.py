@@ -18,7 +18,12 @@ from cove_converter.engines.base import BaseConverterWorker
 
 
 def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8-sig")
+    raw = path.read_bytes()
+    # YAML permits UTF-16 (the spec mandates BOM detection); honour the BOM
+    # instead of crashing in a utf-8 decode before the parser ever runs.
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    return raw.decode("utf-8-sig")
 
 
 class YamlKeyCollisionError(RuntimeError):
@@ -99,7 +104,11 @@ def _json_safe(value):
             seen[jk] = k
             out[jk] = _json_safe(v)
         return out
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (set, frozenset)):
+        # Sets have no stable iteration order (string hashing is randomised
+        # per process); sort so the same input always yields the same JSON.
+        return [_json_safe(v) for v in sorted(value, key=repr)]
+    if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
     if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
         return value.isoformat()
@@ -151,12 +160,23 @@ def _build_collision_loader():
             )
         # Resolve YAML merge keys (`<<: *anchor`) the same way SafeLoader
         # does — otherwise we'd reject perfectly valid merged mappings.
+        # ``flatten_mapping`` prepends the merged pairs to ``node.value``,
+        # so the explicit (spelled-out) keys are the trailing entries.
+        # Per the merge-key spec, an explicit key legally *overrides* a
+        # merged one, so collision detection must only compare explicit
+        # keys against each other.
+        explicit_count = sum(
+            1 for key_node, _ in node.value
+            if key_node.tag != "tag:yaml.org,2002:merge"
+        )
         loader.flatten_mapping(node)
         data: dict = {}
         yield data
+        merged_pairs = node.value[: len(node.value) - explicit_count]
+        explicit_pairs = node.value[len(node.value) - explicit_count:]
         seen_python: list = []
         seen_json: dict[str, object] = {}
-        for key_node, value_node in node.value:
+        for key_node, value_node in explicit_pairs:
             key = loader.construct_object(key_node, deep=True)
             for prev in seen_python:
                 try:
@@ -176,8 +196,16 @@ def _build_collision_loader():
                 )
             seen_python.append(key)
             seen_json[jk] = key
-            value = loader.construct_object(value_node, deep=True)
-            data[key] = value
+        # Merged pairs first, then explicit pairs override unconditionally.
+        # ``flatten_mapping`` already ordered the merged pairs so that plain
+        # last-assignment-wins iteration gives earlier merge sources
+        # precedence, exactly like SafeConstructor.
+        for key_node, value_node in merged_pairs:
+            key = loader.construct_object(key_node, deep=True)
+            data[key] = loader.construct_object(value_node, deep=True)
+        for key_node, value_node in explicit_pairs:
+            key = loader.construct_object(key_node, deep=True)
+            data[key] = loader.construct_object(value_node, deep=True)
 
     _CollisionDetectingLoader.add_constructor(
         yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,

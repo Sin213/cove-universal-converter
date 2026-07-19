@@ -35,6 +35,7 @@ checks (page count mismatch, suspiciously tiny size), we raise
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 import threading
 import warnings
@@ -58,8 +59,16 @@ _log = logging.getLogger("cove_converter.pdf_flatten")
 _PDFIUM_LOCK = threading.Lock()
 
 
-# Substring markers that the user's spec asks us to detect. ``/JavaScript``
-# names the action type; ``/JS`` is the key whose value holds the script.
+# Markers that the user's spec asks us to detect. ``/JavaScript`` names the
+# action type; ``/JS`` is the key whose value holds the script. The marker
+# must be followed by a PDF delimiter (whitespace or ()<>[]{}/%) — a bare
+# substring scan would false-positive on names like ``/JSON`` or literal
+# text in content streams, rerouting clean PDFs through the destructive
+# rasterising flatten path.
+_JS_MARKER_RE = re.compile(
+    rb"/(?:JavaScript|JS)(?=[\x00\t\n\x0c\r ()<>\[\]{}/%])"
+)
+# Longest marker text, used to size the inter-chunk carry.
 _JS_MARKERS: tuple[bytes, ...] = (b"/JavaScript", b"/JS")
 
 # Bounded-memory streaming scan. PDF object ordering is not guaranteed —
@@ -69,10 +78,10 @@ _JS_MARKERS: tuple[bytes, ...] = (b"/JavaScript", b"/JS")
 # (plus a tiny carry-over) in memory at a time.
 _DETECT_CHUNK_BYTES = 1_048_576       # 1 MiB
 # Carry-over between chunks so a marker that straddles a chunk boundary
-# still appears whole in the next iteration's scan window. ``len(marker)
-# - 1`` is the minimum guaranteeing that — anything shorter and the marker
-# can split across the boundary without ever appearing whole in any buffer.
-_BOUNDARY_OVERLAP = max(len(m) for m in _JS_MARKERS) - 1
+# still appears whole in the next iteration's scan window. ``len(marker)``
+# (not the usual ``- 1``) because the regex also needs the one delimiter
+# byte *after* the marker to be present in the same window.
+_BOUNDARY_OVERLAP = max(len(m) for m in _JS_MARKERS)
 
 
 # ---- Render parameters -----------------------------------------------------
@@ -127,9 +136,8 @@ def has_pdf_javascript(path: Path) -> bool:
                 if not chunk:
                     break
                 window = carry + chunk
-                for marker in _JS_MARKERS:
-                    if marker in window:
-                        return True
+                if _JS_MARKER_RE.search(window):
+                    return True
                 # Keep the trailing ``_BOUNDARY_OVERLAP`` bytes so a marker
                 # split across this chunk's end and the next chunk's start
                 # is fully present in the next iteration's window.
@@ -137,6 +145,11 @@ def has_pdf_javascript(path: Path) -> bool:
                     carry = window[-_BOUNDARY_OVERLAP:]
                 else:
                     carry = window
+            # End-of-file counts as a delimiter: a marker that is literally
+            # the last bytes of the file has no following byte for the
+            # regex lookahead to see.
+            if re.search(rb"/(?:JavaScript|JS)\Z", carry):
+                return True
     except OSError:
         return False
 
@@ -252,11 +265,12 @@ def _flatten_pdf_locked(
         progress(5)
 
     # Two-phase assembly: render each page to a JPEG on disk (only one
-    # full-resolution bitmap is alive at any moment), then PIL builds
-    # the output PDF in a single ``save_all`` call. PIL's incremental
-    # append-mode PDF writer falls over past ~4 pages with a "trailer
-    # loop found" parser error, so the per-page-append idiom we use in
-    # ``_enhance_scanned_pdf`` is not safe here. The tempdir is unlinked
+    # full-resolution bitmap is alive at any moment), then append the
+    # JPEGs into the output PDF one page at a time — the same idiom as
+    # ``_enhance_scanned_pdf``. (An earlier note here claimed PIL's
+    # append-mode PDF writer broke past ~4 pages with "trailer loop
+    # found"; that does not reproduce on the Pillow this app pins —
+    # probed clean through 100+ pages.) The tempdir is unlinked
     # automatically when the ``with`` block exits.
     scale = _RENDER_DPI / 72.0
     cancelled_early = False
@@ -333,19 +347,20 @@ def _flatten_pdf_locked(
             raise RuntimeError("flatten produced no pages")
 
         try:
-            first = Image.open(str(page_files[0]))
-            extras = [Image.open(str(p)) for p in page_files[1:]]
-            try:
-                first.save(
-                    str(dst), "PDF",
-                    resolution=float(_RENDER_DPI),
-                    save_all=True,
-                    append_images=extras,
-                )
-            finally:
-                first.close()
-                for e in extras:
-                    e.close()
+            # One page open at a time: the eager append_images list held one
+            # open file descriptor per page and died with "Too many open
+            # files" on 1000+-page documents (PIL materialises append_images
+            # into a list internally, so a lazy iterable can't help). The
+            # per-page append idiom keeps exactly one fd and one decoded
+            # page resident regardless of page count, and preserves the
+            # JPEG DCTDecode pass-through per page.
+            for idx, page_path in enumerate(page_files):
+                with Image.open(str(page_path)) as page_im:
+                    page_im.save(
+                        str(dst), "PDF",
+                        resolution=float(_RENDER_DPI),
+                        append=idx > 0,
+                    )
         except Exception as exc:
             # Tempdir cleanup is automatic, but the partial dst file is
             # ours to drop.

@@ -39,6 +39,10 @@ _UNSHARP_PERCENT        = 80
 _UNSHARP_THRESHOLD      = 3
 _REPACK_JPEG_QUALITY    = 88
 
+# Ceiling for pandoc subprocesses — a hang is a stuck resource fetch or
+# pathological input, not real work (matches engines/pandoc.py).
+_PANDOC_TIMEOUT_S       = 600
+
 
 # ---- Image → PDF -----------------------------------------------------------
 _IMAGE_TO_PDF_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -73,6 +77,21 @@ def _enhance_page(img):
         threshold=_UNSHARP_THRESHOLD,
     ))
     return img
+
+
+def _init_forms_quietly(pdf) -> None:
+    """Bootstrap the form environment right after document construction so
+    ``page.render`` draws filled AcroForm widget values (pypdfium2 contract —
+    see the long note in pdf_flatten.py). A failure here only loses form
+    rendering, never the conversion itself, so problems are swallowed."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            pdf.init_forms()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _enhance_scanned_pdf(
@@ -113,6 +132,7 @@ def _enhance_scanned_pdf(
             ) from exc
         raise RuntimeError(f"Could not open PDF: {exc}") from exc
 
+    _init_forms_quietly(pdf)
     n = len(pdf)
     if n == 0:
         pdf.close()
@@ -274,13 +294,19 @@ def _pandoc_to_html(input_path: Path) -> str:
         "--embed-resources",
         "-o", "-",
     ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        **_no_window_kwargs(),
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_PANDOC_TIMEOUT_S,
+            **_no_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"pandoc timed out after {_PANDOC_TIMEOUT_S}s"
+        ) from exc
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         raise RuntimeError(stderr or f"pandoc exited {result.returncode}")
@@ -316,13 +342,19 @@ def _text_to_doc(text: str, output_path: Path) -> None:
             "-f", "markdown",
             "-o", str(output_path),
         ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            **_no_window_kwargs(),
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=_PANDOC_TIMEOUT_S,
+                **_no_window_kwargs(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"pandoc timed out after {_PANDOC_TIMEOUT_S}s"
+            ) from exc
         if result.returncode != 0:
             raise RuntimeError(
                 result.stderr.strip() or f"pandoc exited {result.returncode}"
@@ -357,6 +389,7 @@ def _pdf_to_cbz(
             ) from exc
         raise RuntimeError(f"Could not open PDF: {exc}") from exc
 
+    _init_forms_quietly(pdf)
     n = len(pdf)
     if n == 0:
         pdf.close()

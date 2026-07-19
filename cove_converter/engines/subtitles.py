@@ -48,6 +48,14 @@ def _read_text(path: Path) -> str:
     # Subtitle files are typically UTF-8 but legacy Windows-1252 is common.
     # `errors='replace'` is preferable to crashing on a stray byte.
     raw = path.read_bytes()
+    # UTF-16 first: it has an unambiguous BOM, and without this check the
+    # latin-1 fallback below would "succeed" and produce NUL-riddled garbage.
+    # UTF-16 SRTs are common from Windows tools.
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
     for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
             return raw.decode(encoding)

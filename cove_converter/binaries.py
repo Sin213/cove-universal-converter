@@ -9,6 +9,7 @@ Resolution order:
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -17,6 +18,8 @@ from pathlib import Path
 def _platform_dir() -> str:
     if sys.platform.startswith("win"):
         return "win"
+    if sys.platform == "darwin":
+        return "mac"
     return "linux"
 
 
@@ -46,7 +49,11 @@ def resolve(name: str) -> str:
         root / "bin" / _platform_dir() / exe,   # legacy dev layout
     ]
     for candidate in candidates:
-        if candidate.is_file():
+        # The exec check keeps a bundled binary that lost its execute bit
+        # from shadowing a working system install found by ``which`` below.
+        if candidate.is_file() and (
+            sys.platform.startswith("win") or os.access(candidate, os.X_OK)
+        ):
             return str(candidate)
 
     found = shutil.which(exe)

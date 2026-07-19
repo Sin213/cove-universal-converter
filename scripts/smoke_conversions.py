@@ -574,8 +574,9 @@ def _ensure_sample(in_ext: str, samples_dir: Path,
         reason = f"no sample generator for {in_ext}"
         _failed_samples[in_ext] = reason
         return None, reason
-    # Build a filesystem-safe filename for compound suffixes.
-    name = "sample" + (in_ext if not in_ext.startswith(".") else in_ext)
+    # Extensions here always carry their leading dot; compound suffixes
+    # (".tar.gz") are already filesystem-safe as-is.
+    name = "sample" + in_ext
     dest = samples_dir / name
     try:
         gen(dest)

@@ -103,7 +103,10 @@ def test_detect_marker_in_central_region(tmp_path):
     """PDF object ordering is not guaranteed; markers can live in the
     middle of a large PDF. Streaming scan must catch them."""
     p = tmp_path / "central.pdf"
-    marker = b"/JavaScript"
+    # Trailing space: a PDF name must end at a delimiter; the detector
+    # rejects /JavaScript glued to further regular characters (that would
+    # be a different name, e.g. /JavaScriptFoo).
+    marker = b"/JavaScript "
     size = 4 * 1024 * 1024
     pos = size // 2
     blob = bytearray(b"a" * pos)
@@ -118,7 +121,7 @@ def test_detect_marker_straddling_chunk_boundary_mid_file(tmp_path):
     via the carry-over between successive streaming chunks."""
     p = tmp_path / "mid_straddle.pdf"
     CHUNK = 1_048_576
-    marker = b"/JavaScript"
+    marker = b"/JavaScript "  # delimiter-terminated PDF name
     size = 4 * CHUNK + 12345
     pos = 2 * CHUNK - 5
     blob = bytearray(b"a" * pos)
@@ -431,15 +434,15 @@ def test_flatten_output_page_count_validation(tmp_path, monkeypatch):
 
     real_save = Image.Image.save
 
-    def _drop_append_images(self, fp, format=None, **kwargs):
-        # Strip ``save_all`` / ``append_images`` so PIL writes only the
-        # first page, simulating an assembler that dropped the rest.
+    def _drop_append(self, fp, format=None, **kwargs):
+        # Force ``append`` off so every page save overwrites the file and
+        # the output ends up with 1 page, simulating an assembler that
+        # dropped the rest.
         if format == "PDF":
-            kwargs.pop("save_all", None)
-            kwargs.pop("append_images", None)
+            kwargs.pop("append", None)
         return real_save(self, fp, format=format, **kwargs)
 
-    monkeypatch.setattr(Image.Image, "save", _drop_append_images)
+    monkeypatch.setattr(Image.Image, "save", _drop_append)
 
     with pytest.raises(RuntimeError, match="page count mismatch"):
         flatten_pdf(src, dst)
@@ -459,13 +462,12 @@ def test_flatten_post_render_failures_log_through_dedicated_logger(tmp_path, mon
 
     real_save = Image.Image.save
 
-    def _drop_append_images(self, fp, format=None, **kwargs):
+    def _drop_append(self, fp, format=None, **kwargs):
         if format == "PDF":
-            kwargs.pop("save_all", None)
-            kwargs.pop("append_images", None)
+            kwargs.pop("append", None)
         return real_save(self, fp, format=format, **kwargs)
 
-    monkeypatch.setattr(Image.Image, "save", _drop_append_images)
+    monkeypatch.setattr(Image.Image, "save", _drop_append)
 
     caplog.set_level("ERROR", logger="cove_converter.pdf_flatten")
     with pytest.raises(RuntimeError, match="page count mismatch"):

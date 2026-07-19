@@ -99,6 +99,12 @@ class FFmpegWorker(BaseConverterWorker):
         cmd += ["-c:v", vcodec]
         if vcodec in ("libx264", "libx265"):
             cmd += ["-crf", str(s.effective_video_crf()), "-preset", preset]
+            # RGB sources (GIF, ProRes 4444, screen recordings) would
+            # otherwise encode as yuv444p, which common players can't
+            # decode. yuv420p needs even dimensions; ceil (not trunc) so a
+            # 1-pixel axis rounds up to 2 instead of collapsing to 0.
+            cmd += ["-pix_fmt", "yuv420p",
+                    "-vf", "scale=ceil(iw/2)*2:ceil(ih/2)*2"]
         elif vcodec == "libvpx-vp9":
             vp9_crf = s.video_crf if s.use_custom_quality else _WEBM_DEFAULT_VP9_CRF
             cmd += ["-crf", str(vp9_crf), "-b:v", "0",
@@ -107,6 +113,12 @@ class FFmpegWorker(BaseConverterWorker):
                 # Default path: keep encode time sane and avoid the
                 # near-lossless "best" deadline that bloats output.
                 cmd += ["-deadline", "good", "-cpu-used", _WEBM_DEFAULT_CPU_USED]
+        else:
+            # qscale encoders (mpeg4, wmv2, mpeg2video) ignore -crf; without
+            # a quality flag they fall back to an uncontrolled default
+            # bitrate. Map the CRF setting (0-51) onto qscale 2-31.
+            qv = max(2, min(31, round(s.effective_video_crf() / 3)))
+            cmd += ["-q:v", str(qv)]
         if acodec == "libopus" and not s.use_custom_quality:
             cmd += ["-c:a", "libopus", "-b:a", f"{_WEBM_DEFAULT_OPUS_KBPS}k"]
         else:
@@ -122,6 +134,7 @@ class FFmpegWorker(BaseConverterWorker):
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            errors="replace",
             bufsize=1,
             **_no_window_kwargs(),
         )

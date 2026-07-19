@@ -10,7 +10,9 @@ plain-data round-trip, not a faithful workbook clone)."""
 from __future__ import annotations
 
 import csv
+import io
 import re
+import sys
 from pathlib import Path
 
 from cove_converter.engines.base import BaseConverterWorker
@@ -35,6 +37,19 @@ def _sanitize_sheet_title(stem: str) -> str:
     return cleaned or "Sheet1"
 
 
+def _read_csv_text(path: Path) -> str:
+    # CSVs in the wild are frequently not UTF-8 (Excel's default export on
+    # Western Windows is CP1252). Same fallback chain as the subtitle engine;
+    # latin-1 is the never-fails last resort.
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def _csv_to_xlsx(input_path: Path, output_path: Path) -> None:
     from openpyxl import Workbook
 
@@ -42,7 +57,17 @@ def _csv_to_xlsx(input_path: Path, output_path: Path) -> None:
     ws = wb.active
     ws.title = _sanitize_sheet_title(input_path.stem)
 
-    with input_path.open("r", encoding="utf-8-sig", newline="") as f:
+    # Lift the default 128 KiB per-field cap; large text cells are legal
+    # CSV. The module stores the limit in a C long, so sys.maxsize
+    # overflows on Windows - halve until accepted.
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            break
+        except OverflowError:
+            limit //= 2
+    with io.StringIO(_read_csv_text(input_path), newline="") as f:
         reader = csv.reader(f)
         for row_idx, row in enumerate(reader, start=1):
             for col_idx, value in enumerate(row, start=1):
@@ -86,7 +111,9 @@ def _xlsx_to_csv(input_path: Path, output_path: Path) -> None:
         ws_values = wb_values.active
         ws_formulas = wb_formulas.active
 
-        with output_path.open("w", encoding="utf-8", newline="") as f:
+        # utf-8-sig: without a BOM, Excel assumes the ANSI codepage and shows
+        # mojibake for non-ASCII cells. The read direction accepts BOMs too.
+        with output_path.open("w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             for value_row, formula_row in zip(
                 ws_values.iter_rows(values_only=True),

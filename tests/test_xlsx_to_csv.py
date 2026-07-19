@@ -41,7 +41,7 @@ class XlsxToCsv(unittest.TestCase):
 
             _xlsx_to_csv(xlsx, csv_out)
 
-            with csv_out.open("r", encoding="utf-8", newline="") as f:
+            with csv_out.open("r", encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.reader(f))
             self.assertEqual(rows[0], ["a", "b", "c"])
             self.assertEqual(rows[1], ["1", "2", "3"])
@@ -65,7 +65,7 @@ class XlsxToCsv(unittest.TestCase):
 
             _xlsx_to_csv(xlsx, csv_out)
 
-            with csv_out.open("r", encoding="utf-8", newline="") as f:
+            with csv_out.open("r", encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.reader(f))
             self.assertEqual(rows[0][0], "1")
             self.assertEqual(rows[0][1], "2")
@@ -95,7 +95,7 @@ class XlsxToCsv(unittest.TestCase):
 
             _xlsx_to_csv(xlsx, csv_out)
 
-            with csv_out.open("r", encoding="utf-8", newline="") as f:
+            with csv_out.open("r", encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.reader(f))
             self.assertEqual(rows[0][0], "'=cmd|'/c calc'!A1")
             self.assertEqual(rows[0][1], "'+1+1")
@@ -122,7 +122,7 @@ class XlsxToCsv(unittest.TestCase):
 
             _xlsx_to_csv(xlsx, csv_out)
 
-            with csv_out.open("r", encoding="utf-8", newline="") as f:
+            with csv_out.open("r", encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.reader(f))
             self.assertEqual(rows[0], ["alpha", "42", "beta gamma"])
             self.assertEqual(rows[1], ["3.14", "x-ray", "no equals here"])

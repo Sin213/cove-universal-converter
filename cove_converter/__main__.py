@@ -41,7 +41,9 @@ def _setup_logging() -> Path | None:
     root.setLevel(logging.INFO)
 
     # Stream handler: useful in dev / when launched from a terminal.
-    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+    # Exact-type check: RotatingFileHandler is a StreamHandler subclass, so
+    # isinstance() would see the file handler and skip the stderr one.
+    if not any(type(h) is logging.StreamHandler for h in root.handlers):
         sh = logging.StreamHandler()
         sh.setFormatter(fmt)
         root.addHandler(sh)
@@ -53,10 +55,16 @@ def _setup_logging() -> Path | None:
         log_path = log_dir / "cove-converter.log"
         # Cap each file at 1 MB; keep 3 rotations. A failing conversion produces
         # ~2 KB of traceback so this comfortably holds many runs.
-        fh = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3,
-                                 encoding="utf-8")
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+        # Idempotent: a repeated setup call must not double-write the log.
+        if not any(
+            isinstance(h, RotatingFileHandler)
+            and getattr(h, "baseFilename", None) == str(log_path)
+            for h in root.handlers
+        ):
+            fh = RotatingFileHandler(log_path, maxBytes=1_000_000,
+                                     backupCount=3, encoding="utf-8")
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
         logging.getLogger("cove_converter").info("log file: %s", log_path)
     except OSError as exc:
         logging.getLogger("cove_converter").warning(

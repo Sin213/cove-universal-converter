@@ -38,15 +38,31 @@ if (-not $Version) {
 
 $App         = "cove-universal-converter"
 $ReleaseDir  = "release"
-$FfmpegUrl   = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-$PandocVer   = "3.1.13"
-$PandocUrl   = "https://github.com/jgm/pandoc/releases/download/$PandocVer/pandoc-$PandocVer-windows-x86_64.zip"
+# Pinned, versioned URLs + SHA-256 (matching the Linux build's policy).
+# The rolling release-essentials URL is mutable - whatever it serves at
+# build time would get bundled unverified.
+# MAINTAINER NOTE: to bump ffmpeg, pick a version from
+# https://www.gyan.dev/ffmpeg/builds/packages/ and take the hash from the
+# published <file>.sha256 sidecar; for pandoc, sha256sum the release zip.
+$FfmpegVer    = "8.1.2"
+$FfmpegUrl    = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$FfmpegVer-essentials_build.zip"
+$FfmpegSha256 = "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec"
+$PandocVer    = "3.1.13"
+$PandocUrl    = "https://github.com/jgm/pandoc/releases/download/$PandocVer/pandoc-$PandocVer-windows-x86_64.zip"
+$PandocSha256 = "347b250e855d0cb4bf9e7dcda3b55a2b5bdae588e637a363810008b75be5ca81"
 
 function Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
 function Download-File([string]$url, [string]$dest) {
     & curl.exe --silent --show-error --fail --location --output $dest $url
     if ($LASTEXITCODE -ne 0) { throw "Download failed: $url" }
+}
+
+function Assert-Sha256([string]$file, [string]$expected, [string]$label) {
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLower()
+    if ($actual -ne $expected.ToLower()) {
+        throw "$label sha256 mismatch: expected $expected, got $actual"
+    }
 }
 
 function Write-Sha256Sidecar([string]$file) {
@@ -86,6 +102,7 @@ $ffTmp = Join-Path ([IO.Path]::GetTempPath()) ("ffmpeg-" + [Guid]::NewGuid())
 New-Item -ItemType Directory -Path $ffTmp | Out-Null
 $ffZip = Join-Path $ffTmp "ffmpeg.zip"
 Download-File $FfmpegUrl $ffZip
+Assert-Sha256 $ffZip $FfmpegSha256 "ffmpeg"
 Expand-Archive -Path $ffZip -DestinationPath $ffTmp -Force
 
 $ffRoot = Get-ChildItem -Path $ffTmp -Directory |
@@ -103,6 +120,7 @@ $pdTmp = Join-Path ([IO.Path]::GetTempPath()) ("pandoc-" + [Guid]::NewGuid())
 New-Item -ItemType Directory -Path $pdTmp | Out-Null
 $pdZip = Join-Path $pdTmp "pandoc.zip"
 Download-File $PandocUrl $pdZip
+Assert-Sha256 $pdZip $PandocSha256 "pandoc"
 Expand-Archive -Path $pdZip -DestinationPath $pdTmp -Force
 $pandocExe = Get-ChildItem -Path $pdTmp -Filter pandoc.exe -Recurse |
              Select-Object -First 1 -ExpandProperty FullName

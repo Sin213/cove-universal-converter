@@ -5,7 +5,11 @@ import sys
 def _exe_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(sys.argv[0]))
+    # Non-frozen (dev) runs: anchor to the package directory, not argv[0] -
+    # resolving argv[0] against the CWD would silently flip the app into
+    # portable mode when launched from a directory that happens to contain
+    # a 'cove-app-data' folder.
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def is_portable():

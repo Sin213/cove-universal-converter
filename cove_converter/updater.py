@@ -52,7 +52,14 @@ class UpdateInfo:
     asset_size: int = 0
 
 
-def _parse_version(v: str) -> tuple[int, int, int]:
+def _parse_version(v: str) -> tuple[int, ...]:
+    """Parse a dotted version into a comparable tuple of ints.
+
+    Handles any number of components (``1.2.3.4`` no longer truncates to
+    ``1.2.3``). Non-digit suffixes within a component are ignored
+    (``1.2.1+build5`` parses as ``1.2.1`` — pre-release/build metadata does
+    not participate in ordering). Trailing zero components are stripped so
+    ``1.2.3.0`` compares equal to ``1.2.3``."""
     v = v.strip().lstrip("vV")
     out: list[int] = []
     for part in v.split("."):
@@ -63,11 +70,11 @@ def _parse_version(v: str) -> tuple[int, int, int]:
             else:
                 break
         out.append(int(digits) if digits else 0)
-        if len(out) == 3:
-            break
+    while len(out) > 3 and out[-1] == 0:
+        out.pop()
     while len(out) < 3:
         out.append(0)
-    return (out[0], out[1], out[2])
+    return tuple(out)
 
 
 def version_newer(latest: str, current: str) -> bool:
@@ -82,7 +89,13 @@ def bundle_kind() -> str:
     if sys.platform == "win32":
         if not getattr(sys, "frozen", False):
             return "source"
-        exe_str = str(Path(sys.executable).resolve())
+        exe_dir = Path(sys.executable).resolve().parent
+        # Explicit portable markers (the same convention portable.py keys
+        # off) beat path heuristics — a Portable.exe kept under a path
+        # containing "Program Files" must not be classified win-setup.
+        if (exe_dir / "portable.marker").is_file() or (exe_dir / "cove-app-data").is_dir():
+            return "win-portable"
+        exe_str = str(exe_dir)
         if "Program Files" in exe_str or r"AppData\Local" in exe_str:
             return "win-setup"
         return "win-portable"
@@ -132,6 +145,15 @@ class UpdateCheckWorker(QObject):
         self._repo = repo
 
     def run(self) -> None:
+        # Any escape here would leave the thread's event loop running with
+        # no quit signal ever emitted, wedging every future check() — treat
+        # a malformed API payload the same as an unreachable API.
+        try:
+            self._run()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"unexpected release payload: {exc}")
+
+    def _run(self) -> None:
         data = fetch_latest_release(self._repo)
         if data is None:
             self.failed.emit("could not reach the releases API")
@@ -215,15 +237,24 @@ class DownloadWorker(QObject):
     """
 
     progress = Signal(int)           # 0–100
-    finished = Signal(str)           # destination path
+    finished = Signal(str, str)      # (installed/downloaded path, replaced old path or "")
     failed = Signal(str)
 
-    def __init__(self, url: str, dest: Path, repo: str, asset_name: str) -> None:
+    def __init__(
+        self,
+        url: str,
+        dest: Path,
+        repo: str,
+        asset_name: str,
+        install_appimage: bool = False,
+    ) -> None:
         super().__init__()
         self._url = url
         self._dest = dest
         self._repo = repo
         self._asset_name = asset_name
+        self._install_appimage = install_appimage
+        self._verified_digest: str | None = None
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -251,7 +282,19 @@ class DownloadWorker(QObject):
                         if total > 0:
                             self.progress.emit(int(written * 100 / total))
             self._verify_checksum()
-            self.finished.emit(str(self._dest))
+            if self._install_appimage:
+                # Last cancellation point before anything irreversible;
+                # the swap also re-hashes right before the move (TOCTOU).
+                if self._cancelled:
+                    raise RuntimeError("cancelled")
+                # Swapping here (worker thread) keeps a large cross-device
+                # copy off the GUI thread.
+                new_path, old_path = swap_in_appimage(
+                    self._dest, expected_sha256=self._verified_digest,
+                )
+                self.finished.emit(str(new_path), str(old_path))
+            else:
+                self.finished.emit(str(self._dest), "")
         except Exception as exc:  # noqa: BLE001
             try:
                 self._dest.unlink(missing_ok=True)
@@ -278,33 +321,68 @@ class DownloadWorker(QObject):
                 f"checksum mismatch for {self._asset_name}: "
                 f"expected {expected}, got {actual}"
             )
+        self._verified_digest = expected
 
 
-def swap_in_appimage(new_path: Path) -> Path:
+def swap_in_appimage(
+    new_path: Path, expected_sha256: str | None = None,
+) -> tuple[Path, Path]:
     """Install `new_path` next to the running AppImage under its own
-    versioned filename, remove the old file, and return the new path.
+    versioned filename and return ``(new target path, old path)``.
 
     Keeping the release asset's filename (instead of overwriting the old
     file in place) matches electron-updater semantics and keeps the
     on-disk name truthful - external launchers like Cove Nexus derive the
-    installed version from it."""
+    installed version from it.
+
+    The old binary is deliberately NOT removed here: the returned second
+    path is the rollback copy the caller keeps until the relaunched
+    process is confirmed started. When the asset filename matches the
+    running AppImage (same-name update), the replace would overwrite the
+    only copy of the old bytes, so they are first preserved under a
+    ``.cove-rollback`` sibling and that path is returned instead.
+    If ``expected_sha256`` is given, the staged file is re-hashed right
+    before the final rename so a file swapped under us between download
+    verification and install is rejected."""
     current = os.environ.get("APPIMAGE")
     if not current:
         raise RuntimeError("APPIMAGE env var not set - not an AppImage install")
     old = Path(current).resolve()
     target = old.parent / new_path.name
+    rollback = old
+    made_rollback_copy = False
     tmp = target.with_name(target.name + ".part")
-    shutil.move(str(new_path), str(tmp))
-    mode = os.stat(tmp).st_mode
-    os.chmod(tmp, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    os.replace(tmp, target)
-    if target != old:
+    try:
+        if target == old:
+            rollback = old.with_name(old.name + ".cove-rollback")
+            shutil.copy2(old, rollback)
+            made_rollback_copy = True
+        shutil.move(str(new_path), str(tmp))
+        if expected_sha256 is not None:
+            actual = _hash_file(tmp)
+            if actual != expected_sha256:
+                raise RuntimeError(
+                    f"checksum mismatch after staging: "
+                    f"expected {expected_sha256}, got {actual}"
+                )
+        mode = os.stat(tmp).st_mode
+        os.chmod(tmp, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        os.replace(tmp, target)
+    except Exception:
+        # Never leave stale staging/rollback files next to the install on
+        # failure (the old binary itself is untouched at this point).
         try:
-            old.unlink()  # unlinking the running file is fine on Linux
+            tmp.unlink(missing_ok=True)
         except OSError:
             pass
+        if made_rollback_copy:
+            try:
+                rollback.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
     os.environ["APPIMAGE"] = str(target)
-    return target
+    return target, rollback
 
 
 def relaunch(path: Path) -> None:
@@ -345,6 +423,27 @@ class UpdateController(QObject):
         self._download_worker: DownloadWorker | None = None
         self._progress: QProgressDialog | None = None
         self._prompt_shown = False
+        app = QApplication.instance()
+        if app is not None:
+            # Qt destroys parented QThreads on teardown; give in-flight
+            # check/download threads a chance to finish first, or the
+            # process aborts with "QThread: Destroyed while thread is
+            # still running".
+            app.aboutToQuit.connect(self._shutdown_threads)
+
+    def _shutdown_threads(self) -> None:
+        for worker, thread in (
+            (self._worker, self._thread),
+            (self._download_worker, self._download_thread),
+        ):
+            if thread is None:
+                continue
+            if worker is not None:
+                cancel = getattr(worker, "cancel", None)
+                if cancel is not None:
+                    cancel()
+            thread.quit()
+            thread.wait(10000)
 
     def check(self) -> None:
         if self._thread is not None:
@@ -409,9 +508,16 @@ class UpdateController(QObject):
         if not info.asset_url or not info.asset_name:
             _open_url(info.release_url)
             return
+        name = info.asset_name
+        # The asset name comes straight from the release JSON; refuse
+        # anything that could escape the cache dir when joined below.
+        if (not name or name in (".", "..")
+                or "/" in name or "\\" in name or ":" in name):
+            _open_url(info.release_url)
+            return
         cache = Path(os.path.expanduser(f"~/.cache/{self._cache_subdir}"))
         cache.mkdir(parents=True, exist_ok=True)
-        dest = cache / info.asset_name
+        dest = cache / name
 
         self._progress = QProgressDialog(
             f"Downloading {info.asset_name}…", "Cancel", 0, 100, self._parent,
@@ -423,32 +529,82 @@ class UpdateController(QObject):
         self._progress.setValue(0)
 
         thread = QThread(self)
-        worker = DownloadWorker(info.asset_url, dest, self._repo, info.asset_name)
+        worker = DownloadWorker(
+            info.asset_url, dest, self._repo, name, install_appimage=True,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        self._progress.canceled.connect(worker.cancel)
+        # DirectConnection: the worker thread's event loop is blocked inside
+        # run() for the whole download, so a (default) queued invocation of
+        # cancel() would never be delivered until the download had already
+        # finished. cancel() only sets a bool, so calling it from the GUI
+        # thread is safe.
+        self._progress.canceled.connect(worker.cancel, Qt.DirectConnection)
         worker.progress.connect(self._progress.setValue, Qt.QueuedConnection)
-        worker.finished.connect(self._on_downloaded, Qt.QueuedConnection)
+        # Bind the worker into the slot: reading self._download_worker there
+        # would race _on_download_thread_done clearing the pointer.
+        worker.finished.connect(
+            lambda new, rb, w=worker: self._on_downloaded(new, rb, w),
+            Qt.QueuedConnection,
+        )
         worker.failed.connect(self._on_download_failed, Qt.QueuedConnection)
         thread.finished.connect(self._on_download_thread_done, Qt.QueuedConnection)
         self._download_thread = thread
         self._download_worker = worker
         thread.start()
 
-    def _on_downloaded(self, path: str) -> None:
+    def _on_downloaded(
+        self, new_path_str: str, rollback_str: str, worker: DownloadWorker,
+    ) -> None:
         if self._progress is not None:
             self._progress.close()
+        new_path = Path(new_path_str)
+        rollback = Path(rollback_str) if rollback_str else None
+        # A ``.cove-rollback`` sibling means the update reused the running
+        # file's name and the old bytes only survive in that copy.
+        same_name = (
+            rollback is not None
+            and rollback.name.endswith(".cove-rollback")
+        )
+        def _roll_back() -> None:
+            # The old bytes were kept on disk for exactly this case.
+            if rollback is None:
+                return
+            try:
+                if same_name:
+                    # Restore the old bytes over the overwritten file.
+                    os.replace(rollback, new_path)
+                else:
+                    new_path.unlink(missing_ok=True)
+                    os.environ["APPIMAGE"] = str(rollback)
+            except OSError:
+                pass
+
+        if worker._cancelled:
+            # Cancelled between swap completion and this slot: undo the
+            # swap so a cancelled update never takes effect, not even on
+            # the next launch.
+            _roll_back()
+            return
         try:
-            new_path = swap_in_appimage(Path(path))
+            relaunch(new_path)
         except Exception as exc:  # noqa: BLE001
+            _roll_back()
             QMessageBox.warning(
                 self._parent, "Update failed",
-                f"Couldn't swap in the new AppImage:\n{exc}",
+                f"Couldn't start the updated AppImage:\n{exc}\n"
+                "The previous version was kept.",
             )
             return
-        relaunch(new_path)
+        # New process is running; now it's safe to drop the old copy
+        # (the previous versioned file, or the same-name rollback sibling).
+        if rollback is not None and rollback != new_path:
+            try:
+                rollback.unlink()  # unlinking the running file is fine on Linux
+            except OSError:
+                pass
         app = QApplication.instance()
         if app is not None:
             app.quit()
@@ -456,6 +612,9 @@ class UpdateController(QObject):
     def _on_download_failed(self, msg: str) -> None:
         if self._progress is not None:
             self._progress.close()
+        if msg == "cancelled":
+            # User-initiated; a warning box would be noise.
+            return
         QMessageBox.warning(
             self._parent, "Update failed",
             f"The download didn't complete:\n{msg}",

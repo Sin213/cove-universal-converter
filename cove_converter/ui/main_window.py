@@ -159,7 +159,10 @@ def _icon_pixmap(svg_bytes: bytes, size: int, color: str | None = None) -> QPixm
 
     Cached by ``(svg_id, size, color)`` so the same icon isn't re-rasterized
     every time it's used."""
-    key = (id(svg_bytes), size, color)
+    dpr = _screen_dpr()
+    # DPR is part of the key: on mixed-DPI multi-monitor setups a pixmap
+    # rasterised for one screen must not be reused on another.
+    key = (id(svg_bytes), size, color, dpr)
     cached = _PIXMAP_CACHE.get(key)
     if cached is not None:
         return cached
@@ -167,7 +170,6 @@ def _icon_pixmap(svg_bytes: bytes, size: int, color: str | None = None) -> QPixm
     src = svg_bytes
     if color and b"currentColor" in src:
         src = src.replace(b"currentColor", color.encode())
-    dpr = _screen_dpr()
     px = max(1, int(round(size * dpr)))
     renderer = QSvgRenderer(src)
     pm = QPixmap(px, px)
@@ -615,6 +617,12 @@ class MainWindow(QMainWindow):
         self._batch_failed = 0
         self._batch_skipped = 0
         self._batch_total = 0
+        # Cancelled workers whose rows were removed. Held until their
+        # QThread finishes - dropping the last reference to a live QThread
+        # destroys it mid-run and crashes.
+        self._dead_workers: list = []
+        # Workers a refused closeEvent is waiting out (see closeEvent).
+        self._close_pending_workers: list = []
         self._log_entries: list[tuple[str, str, str, str | None]] = []
         self._log_collapsed = False
 
@@ -683,9 +691,14 @@ class MainWindow(QMainWindow):
         self._toast = _Toast(self)
 
         # ---- Shortcuts: delete to remove rows, Esc to clear-all? Just delete. ----
+        # WidgetWithChildrenShortcut: the default WindowShortcut context
+        # would fire these while focus sits in the log view or a combo and
+        # silently remove the selected rows.
         del_sc = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.table)
+        del_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         del_sc.activated.connect(self._remove_selected_rows)
         bs_sc = QShortcut(QKeySequence(Qt.Key.Key_Backspace), self.table)
+        bs_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         bs_sc.activated.connect(self._remove_selected_rows)
 
         # ---- Updater ----
@@ -711,6 +724,43 @@ class MainWindow(QMainWindow):
         # pinned to the bottom-right of the window.
         s = self._size_grip.sizeHint()
         self._size_grip.move(self.width() - s.width(), self.height() - s.height())
+        # Keep the toast pinned just below the title bar.
+        if hasattr(self, "_toast") and self._toast.isVisible():
+            self._toast.adjustSize()
+            self._toast.move((self.width() - self._toast.width()) // 2, 56)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        # Closing mid-conversion would otherwise destroy running QThreads
+        # ("QThread: Destroyed while thread is still running" + undefined
+        # behaviour). Cancel everything, then give each worker a bounded
+        # wait; the cancel flag terminates ffmpeg/pandoc children promptly.
+        workers = [r.worker for r in self._rows if r.worker is not None]
+        workers.extend(self._dead_workers)
+        for worker in workers:
+            if worker.isRunning():
+                worker.cancel()
+        for worker in workers:
+            if worker.isRunning():
+                worker.wait(5000)
+        still_running = [w for w in workers if w.isRunning()]
+        if still_running:
+            # A worker survived the bounded wait (e.g. a blocking library
+            # call that can't observe the cancel flag yet). Refuse this
+            # close and finish it as soon as the stragglers stop - never
+            # let teardown destroy a live QThread.
+            self._close_pending_workers = still_running
+            for w in still_running:
+                w.finished.connect(self._finish_deferred_close)
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _finish_deferred_close(self) -> None:
+        self._close_pending_workers = [
+            w for w in self._close_pending_workers if w.isRunning()
+        ]
+        if not self._close_pending_workers:
+            self.close()
 
     def _set_btn_icon(self, btn, svg: bytes, size: int, token: str) -> None:
         """Set ``btn``'s icon from ``svg`` painted with ``theme_color(token)``
@@ -1040,7 +1090,11 @@ class MainWindow(QMainWindow):
             self._add_files([Path(p) for p in paths])
 
     def _show_formats_dialog(self) -> None:
-        FormatsDialog(self).exec()
+        dialog = FormatsDialog(self)
+        dialog.exec()
+        # Parented dialogs survive as hidden children of the window until
+        # it dies; long sessions would accumulate one per open.
+        dialog.deleteLater()
 
     def _show_quality_dialog(self) -> None:
         # Enhance-PDF moved to a per-row inline checkbox (visible whenever a
@@ -1051,6 +1105,7 @@ class MainWindow(QMainWindow):
             self._settings = dialog.result_settings()
             self._settings.save()
             self._toast.show_message("Quality settings saved")
+        dialog.deleteLater()
 
     def _browse_output_dir(self) -> None:
         start = str(self._output_dir) if self._output_dir else str(Path.home())
@@ -1109,10 +1164,17 @@ class MainWindow(QMainWindow):
     def _add_files(self, paths: list[Path]) -> None:
         accepted = 0
         accepted_names: list[str] = []
+        # Skip already-queued sources: duplicate rows resolve to the same
+        # output path, and two workers racing os.replace onto one
+        # destination silently lose one result.
+        queued = {r.path for r in self._rows}
         for path in paths:
+            if path in queued:
+                continue
             info = info_for(effective_suffix(path))
             if info is None:
                 continue
+            queued.add(path)
             row = FileRow(path=path, target_ext=info.targets[0])
             self._rows.append(row)
             self._append_table_row(row)
@@ -1196,15 +1258,36 @@ class MainWindow(QMainWindow):
             return f"{n / (1024 * 1024):.1f} MB"
         return f"{n / (1024 * 1024 * 1024):.2f} GB"
 
+    def _retire_worker(self, worker) -> None:
+        """Cancel a worker whose row is going away, keeping a strong
+        reference alive until its QThread actually finishes."""
+        if worker is None or not worker.isRunning():
+            return
+        worker.cancel()
+        self._dead_workers.append(worker)
+        worker.finished.connect(lambda w=worker: self._reap_dead_worker(w))
+
+    def _reap_dead_worker(self, worker) -> None:
+        try:
+            self._dead_workers.remove(worker)
+        except ValueError:
+            pass
+
     def _clear(self) -> None:
         for row in self._rows:
-            if row.worker is not None:
-                row.worker.cancel()
+            self._retire_worker(row.worker)
         self._rows.clear()
         self._row_widgets.clear()
         self.table.setRowCount(0)
         self._pending_rows.clear()
         self._active_rows.clear()
+        # Reset batch accounting - otherwise the cancelled workers' eventual
+        # drain announces a stale "0 of N done" toast for a cleared queue,
+        # and a new batch started before the drain merges into dead counters.
+        self._batch_done = 0
+        self._batch_failed = 0
+        self._batch_skipped = 0
+        self._batch_total = 0
         self.status_msg.setText("")
         self.open_file_btn.setVisible(False)
         self.show_folder_btn.setVisible(False)
@@ -1267,18 +1350,40 @@ class MainWindow(QMainWindow):
             if target_combo is not None and target_combo.findText(ext) >= 0:
                 with QSignalBlocker(target_combo):
                     target_combo.setCurrentText(ext)
-            self._on_target_changed(row, ext)
+                # Inside the guard: a row whose combo doesn't offer this
+                # ext must not get a target_ext it can't display (routing
+                # would fall through to the wrong engine).
+                self._on_target_changed(row, ext)
 
     def _on_target_changed(self, row: FileRow, ext: str) -> None:
         """Hook fired whenever a row's target_ext changes (per-row combo or
         batch dropdown). Updates per-row state and toggles the Enhance-PDF
         checkbox visibility (only meaningful when target is .pdf)."""
-        row.target_ext = ext
         try:
             index = self._rows.index(row)
         except ValueError:
             return
         cells = self._row_widgets[index]
+        if row.status in ("Queued", "Processing"):
+            # The in-flight worker was built with the old output path;
+            # accepting the change would desync UI state from the file the
+            # worker actually writes. Snap the combo back.
+            target_combo = cells.get("target")
+            if target_combo is not None:
+                with QSignalBlocker(target_combo):
+                    target_combo.setCurrentText(row.target_ext)
+            return
+        if ext != row.target_ext and row.status not in ("Pending", "Ready"):
+            # Terminal-state row (Done / Failed / Cancelled / Unsupported):
+            # retargeting starts a fresh lifecycle, otherwise a Done row
+            # can never be reconverted and its open/show actions keep
+            # pointing at the old output.
+            row.completed_output = None
+            row.override_output = None
+            row.error_log = None
+            self._set_status(index, "Pending")
+            self._set_progress(index, 0)
+        row.target_ext = ext
         check = cells.get("enhance_pdf")
         if check is not None:
             check.setVisible(ext == ".pdf")
@@ -1330,8 +1435,7 @@ class MainWindow(QMainWindow):
         for r in rows:
             if 0 <= r < len(self._rows):
                 row = self._rows[r]
-                if row.worker is not None and row.worker.isRunning():
-                    row.worker.cancel()
+                self._retire_worker(row.worker)
                 self._rows.pop(r)
                 self._row_widgets.pop(r)
                 self.table.removeRow(r)
@@ -1393,6 +1497,10 @@ class MainWindow(QMainWindow):
             # outcome is decided — otherwise a preflight failure here
             # would still surface the prior run's log via "View log".
             row.error_log = None
+            # A fresh attempt recomputes its natural output; a stale rename
+            # override from an earlier run would silently retarget the old
+            # "(1)" path even after the collision is gone.
+            row.override_output = None
             if engine_for(effective_suffix(row.path), row.target_ext) is None:
                 self._record_preflight_failure(
                     i,
@@ -1428,7 +1536,22 @@ class MainWindow(QMainWindow):
             if choice == "rename":
                 reserved: set[Path] = set()
                 for r, out in conflicts:
-                    candidate = unique_path(out, reserved)
+                    try:
+                        candidate = unique_path(out, reserved)
+                    except RuntimeError as exc:
+                        # 1000 numbered variants exhausted - fail this row
+                        # instead of blowing up the whole click handler.
+                        try:
+                            idx = self._rows.index(r)
+                        except ValueError:
+                            continue
+                        self._record_preflight_failure(
+                            idx, "Failed: no free output name", str(exc),
+                        )
+                        if r in eligible:
+                            eligible.remove(r)
+                        pre_failed += 1
+                        continue
                     r.override_output = candidate
                     reserved.add(candidate)
 
@@ -1470,6 +1593,8 @@ class MainWindow(QMainWindow):
         # A retry/start hits this path; drop any prior worker traceback
         # *before* preflight so a stale log can't survive a new attempt.
         row.error_log = None
+        # Fresh attempt: recompute the natural output (see _convert_all).
+        row.override_output = None
 
         if engine_for(effective_suffix(row.path), row.target_ext) is None:
             self._record_preflight_failure(
@@ -1495,7 +1620,13 @@ class MainWindow(QMainWindow):
             if choice == "cancel":
                 return
             if choice == "rename":
-                row.override_output = unique_path(out)
+                try:
+                    row.override_output = unique_path(out)
+                except RuntimeError as exc:
+                    self._record_preflight_failure(
+                        index, "Failed: no free output name", str(exc),
+                    )
+                    return
 
         if row in self._pending_rows or row in self._active_rows:
             return
@@ -1553,6 +1684,7 @@ class MainWindow(QMainWindow):
         # outcome is decided — covers both the engine-missing branch below
         # and the worker-creation path that follows.
         row.error_log = None
+        row.completed_output = None
         engine = engine_for(effective_suffix(row.path), row.target_ext)
         if engine is None:
             self._record_preflight_failure(
@@ -1582,6 +1714,12 @@ class MainWindow(QMainWindow):
         # conversion can shift indices but the row identity stays stable.
         worker.progress.connect(lambda pct, rr=row: self._on_worker_progress(rr, pct))
         worker.status.connect(lambda text, rr=row: self._on_worker_status(rr, text))
+        # Record the path the worker *actually* wrote - recomputing it at
+        # finish time would go stale if the target or output dir changed
+        # while the conversion ran.
+        worker.finished_ok.connect(
+            lambda p, rr=row: setattr(rr, "completed_output", Path(p))
+        )
         worker.failed.connect(
             lambda msg, tb, rr=row: self._on_worker_failed(rr, msg, tb)
         )
@@ -1641,7 +1779,10 @@ class MainWindow(QMainWindow):
             status = row.status
             if status == "Done":
                 self._batch_done += 1
-                row.completed_output = row.resolve_output(self._output_dir)
+                if row.completed_output is None:
+                    # Fallback only - finished_ok normally recorded the
+                    # real path already.
+                    row.completed_output = row.resolve_output(self._output_dir)
                 # A successful conversion supersedes any prior failure;
                 # don't let a stale log linger on a now-Done row.
                 row.error_log = None
@@ -1674,7 +1815,15 @@ class MainWindow(QMainWindow):
             msg = f"✓ All {total} conversions complete"
             self._toast.show_message(msg)
         self.status_msg.setText(msg)
-        QTimer.singleShot(8000, lambda: self.status_msg.setText(""))
+        # Only clear if the message is still ours - batch A's timer must
+        # not wipe batch B's newer summary.
+        QTimer.singleShot(
+            8000,
+            lambda m=msg: (
+                self.status_msg.setText("")
+                if self.status_msg.text() == m else None
+            ),
+        )
         self.convert_btn.setEnabled(True)
         self._batch_total = 0
         self._batch_skipped = 0
@@ -1774,6 +1923,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
         dlg.exec()
+        dlg.deleteLater()
 
     # =========================================================
     # Row status / tinting
@@ -1897,10 +2047,3 @@ class MainWindow(QMainWindow):
         if edge in (Qt.Edge.TopEdge, Qt.Edge.BottomEdge):
             return Qt.CursorShape.SizeVerCursor
         return Qt.CursorShape.ArrowCursor
-
-    def resizeEvent(self, event):  # noqa: N802
-        super().resizeEvent(event)
-        # Keep the toast pinned just below the title bar.
-        if hasattr(self, "_toast") and self._toast.isVisible():
-            self._toast.adjustSize()
-            self._toast.move((self.width() - self._toast.width()) // 2, 56)

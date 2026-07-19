@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import posixpath
 import shutil
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -45,16 +46,31 @@ def _tar_mode(out_ext: str, *, write: bool) -> str:
     return base
 
 
+# Extraction hits the local filesystem, so duplicate detection must model
+# the local filesystem's name folding: case-insensitive matching on Windows
+# and macOS, and Windows additionally strips trailing dots/spaces from path
+# components. Without this, ``Foo.txt`` vs ``foo.txt`` (or ``foo.txt.``)
+# passes validation and the second extract silently overwrites the first.
+_FOLD_CASE = sys.platform.startswith("win") or sys.platform == "darwin"
+_STRIP_TRAILING = sys.platform.startswith("win")
+
+
 def _dedup_key(name: str) -> str:
     """Normalize a member path for duplicate detection. Both ZIP and TAR use
     forward-slash paths; ``posixpath.normpath`` collapses ``./`` and ``//`` and
     strips trailing slashes — so ``foo``, ``./foo``, and ``foo/`` all map to
     the same key. This catches duplicate entries and file/dir-type collisions
     where one logical path appears twice and the second extract would overwrite
-    the first."""
+    the first. On case-insensitive platforms the key is additionally folded to
+    match how the local filesystem collapses names."""
     if not name:
         return name
-    return posixpath.normpath(name)
+    key = posixpath.normpath(name)
+    if _STRIP_TRAILING:
+        key = "/".join(part.rstrip(". ") for part in key.split("/"))
+    if _FOLD_CASE:
+        key = key.casefold()
+    return key
 
 
 def _is_within(parent: Path, child: Path) -> bool:

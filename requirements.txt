@@ -1,5 +1,7 @@
 PySide6>=6.6
-Pillow>=10.0
+# >=12.3: PIL's append-mode PDF writer (used by PDF flatten/enhance
+# assembly) raises "trailer loop found" past ~4 pages on earlier versions.
+Pillow>=12.3
 pillow-heif>=0.18
 pypdf>=4.3
 pypdfium2>=4.30
