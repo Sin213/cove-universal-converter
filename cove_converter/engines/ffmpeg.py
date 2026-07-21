@@ -42,6 +42,51 @@ _VIDEO_CODEC: dict[str, str] = {
     ".ts":   "libx264",
 }
 
+# Software H.264/H.265 encoders and their (NVENC, AMF) hardware equivalents.
+# Only these two have a GPU path; VP9/mpeg4/wmv2/mpeg2video stay CPU-only.
+_HW_EQUIV: dict[str, tuple[str, str]] = {
+    "libx264": ("h264_nvenc", "h264_amf"),
+    "libx265": ("hevc_nvenc", "hevc_amf"),
+}
+
+# Hardware encoders reachable from an actual output format. Today every
+# hardware-capable output routes to libx264, so this resolves to the H.264
+# encoders only; if an libx265 output is ever added, its HEVC encoders join
+# automatically. Detection (warm_cache / UI readiness) targets exactly this
+# set so availability reflects what _build_cmd can really select — not an
+# unused HEVC encoder.
+_HW_OUTPUT_CODECS = {c for c in _VIDEO_CODEC.values() if c in _HW_EQUIV}
+NVENC_ENCODERS: tuple[str, ...] = tuple(
+    sorted({_HW_EQUIV[c][0] for c in _HW_OUTPUT_CODECS}))
+AMF_ENCODERS: tuple[str, ...] = tuple(
+    sorted({_HW_EQUIV[c][1] for c in _HW_OUTPUT_CODECS}))
+
+# yuv420p + even dimensions. yuv420p needs even dims; ceil (not trunc) so a
+# 1-pixel axis rounds up to 2 instead of collapsing to 0. Hardware encoders
+# need even dims too, so this applies to every video branch.
+_EVEN_SCALE_ARGS = ["-pix_fmt", "yuv420p", "-vf", "scale=ceil(iw/2)*2:ceil(ih/2)*2"]
+
+
+def hw_encode_args(encoder: str, crf: int) -> list[str]:
+    """Vendor-specific encode options for a hardware (NVENC/AMF) encoder.
+
+    Shared by ``_build_cmd`` and the hwaccel detection probe so detection
+    validates the exact option set production will emit — not just that the
+    encoder name exists and runs with defaults. A build/driver that exposes the
+    encoder but rejects one of these options fails the probe and falls back to
+    CPU instead of failing the real job.
+    """
+    if encoder.endswith("_nvenc"):
+        return ["-c:v", encoder, "-preset", "p5", "-tune", "hq",
+                "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+    if encoder.endswith("_amf"):
+        # AMF CQP has no single -qp knob; it exposes per-frame-type quantizers.
+        return ["-c:v", encoder, "-quality", "balanced",
+                "-usage", "transcoding", "-rc", "cqp",
+                "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf)]
+    return ["-c:v", encoder]
+
+
 _LOSSLESS_AUDIO = {"pcm_s16le", "pcm_s16be", "flac"}
 
 # WebM defaults. VP9's CRF scale runs hotter than x264's: the near-lossless
@@ -73,6 +118,10 @@ class FFmpegWorker(BaseConverterWorker):
     """
 
     def _build_cmd(self) -> list[str]:
+        # Imported lazily: hwaccel imports _no_window_kwargs from this module,
+        # so a top-level import here would be circular.
+        from cove_converter.engines import hwaccel
+
         s = self.settings
         out_ext = self.output_path.suffix.lower()
         cmd = [resolve(FFMPEG), "-y", "-i", str(self.input_path)]
@@ -96,18 +145,33 @@ class FFmpegWorker(BaseConverterWorker):
         vcodec = _VIDEO_CODEC.get(out_ext, "libx264")
         acodec = "libopus" if out_ext == ".webm" else "aac"
         preset = s.effective_video_preset()
-        cmd += ["-c:v", vcodec]
-        if vcodec in ("libx264", "libx265"):
-            cmd += ["-crf", str(s.effective_video_crf()), "-preset", preset]
+
+        # Offload H.264/H.265 to a GPU encoder when the user's preference
+        # allows it and a live probe confirms it works. Anything else (VP9,
+        # mpeg4, wmv2, mpeg2video) has no hardware path and stays on CPU.
+        nv, amf = _HW_EQUIV.get(vcodec, ("", ""))
+        pref = s.encoder_pref
+        use_nvenc = bool(
+            nv and pref in ("auto", "nvenc") and hwaccel.nvenc_available(nv)
+        )
+        use_amf = bool(
+            amf and pref in ("auto", "amf")
+            and hwaccel.amf_available(amf) and not use_nvenc
+        )
+        crf = s.effective_video_crf()
+
+        if use_nvenc:
+            cmd += hw_encode_args(nv, crf) + _EVEN_SCALE_ARGS
+        elif use_amf:
+            cmd += hw_encode_args(amf, crf) + _EVEN_SCALE_ARGS
+        elif vcodec in ("libx264", "libx265"):
+            cmd += ["-c:v", vcodec, "-crf", str(crf), "-preset", preset]
             # RGB sources (GIF, ProRes 4444, screen recordings) would
-            # otherwise encode as yuv444p, which common players can't
-            # decode. yuv420p needs even dimensions; ceil (not trunc) so a
-            # 1-pixel axis rounds up to 2 instead of collapsing to 0.
-            cmd += ["-pix_fmt", "yuv420p",
-                    "-vf", "scale=ceil(iw/2)*2:ceil(ih/2)*2"]
+            # otherwise encode as yuv444p, which common players can't decode.
+            cmd += _EVEN_SCALE_ARGS
         elif vcodec == "libvpx-vp9":
             vp9_crf = s.video_crf if s.use_custom_quality else _WEBM_DEFAULT_VP9_CRF
-            cmd += ["-crf", str(vp9_crf), "-b:v", "0",
+            cmd += ["-c:v", vcodec, "-crf", str(vp9_crf), "-b:v", "0",
                     "-row-mt", "1", "-pix_fmt", "yuv420p"]
             if not s.use_custom_quality:
                 # Default path: keep encode time sane and avoid the
@@ -118,7 +182,7 @@ class FFmpegWorker(BaseConverterWorker):
             # a quality flag they fall back to an uncontrolled default
             # bitrate. Map the CRF setting (0-51) onto qscale 2-31.
             qv = max(2, min(31, round(s.effective_video_crf() / 3)))
-            cmd += ["-q:v", str(qv)]
+            cmd += ["-c:v", vcodec, "-q:v", str(qv)]
         if acodec == "libopus" and not s.use_custom_quality:
             cmd += ["-c:a", "libopus", "-b:a", f"{_WEBM_DEFAULT_OPUS_KBPS}k"]
         else:

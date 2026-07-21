@@ -18,7 +18,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from cove_converter.settings import AUDIO_BITRATES, VIDEO_PRESETS, ConversionSettings
+from cove_converter.engines import hwaccel
+from cove_converter.settings import (
+    AUDIO_BITRATES,
+    ENCODER_KEY_MAP,
+    ENCODER_LABEL_MAP,
+    ENCODER_OPTIONS,
+    VIDEO_PRESETS,
+    ConversionSettings,
+)
 
 
 _X_SVG = b"""<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14' fill='none'
@@ -246,6 +254,15 @@ class QualityDialog(QDialog):
         # Concurrency is independent of the use_custom_quality toggle.
         # (It still applies even when default quality is used.)
 
+        # Video encoder (hardware offload). Independent of the customize
+        # toggle, so it lives outside self._tracked. Unavailable GPU vendors
+        # are greyed out via the cached hwaccel probes.
+        v.addLayout(self._labeled_row("Video encoder"))
+        self.encoder_combo = QComboBox(body)
+        self.encoder_combo.addItems(list(ENCODER_OPTIONS))
+        self._disable_unavailable_encoders(current.encoder_pref)
+        v.addWidget(self.encoder_combo)
+
         # Advanced (CRF + WebP) — only matters when "customize" is on, kept compact.
         v.addWidget(self._sep())
         v.addLayout(self._labeled_row("Advanced"))
@@ -324,6 +341,32 @@ class QualityDialog(QDialog):
         sep.setObjectName("sep")
         return sep
 
+    def _disable_unavailable_encoders(self, current_pref: str) -> None:
+        """Grey out GPU vendors with no working encoder and pick the current one.
+
+        If the saved preference points at a now-unavailable vendor, the combo
+        resets to Automatic rather than leaving a disabled item selected.
+        """
+        # Cache-only tri-state verdicts: the modal must never run a blocking
+        # probe on the UI thread. True = known-available, False = known-
+        # unavailable, None = still unknown (startup probe outstanding).
+        vendor_verdict = {"nvenc": hwaccel.nvenc_verdict(), "amf": hwaccel.amf_verdict()}
+        model = self.encoder_combo.model()
+        for idx, label in enumerate(ENCODER_OPTIONS):
+            key = ENCODER_KEY_MAP[label]
+            # Grey out anything not confirmed available (unknown greys too, so
+            # the user can't pick a vendor whose probe hasn't landed yet).
+            if key in vendor_verdict and vendor_verdict[key] is not True:
+                model.item(idx).setEnabled(False)
+
+        pref = current_pref
+        # Only discard a saved vendor preference once its probe has *completed*
+        # and failed (False). A still-unknown verdict (None) preserves it, so a
+        # dialog opened before warm-up finishes can't silently reset it.
+        if pref in vendor_verdict and vendor_verdict[pref] is False:
+            pref = "auto"
+        self.encoder_combo.setCurrentText(ENCODER_LABEL_MAP.get(pref, ENCODER_OPTIONS[0]))
+
     def _on_toggle(self, enabled: bool) -> None:
         for w in self._tracked:
             w.setEnabled(enabled)
@@ -343,5 +386,6 @@ class QualityDialog(QDialog):
             jpeg_quality=self.jpeg.value(),
             webp_quality=self.webp.value(),
             max_concurrent=self.concurrent.value(),
+            encoder_pref=ENCODER_KEY_MAP.get(self.encoder_combo.currentText(), "auto"),
             pdf_enhance_dpi=self._initial_pdf_enhance_dpi,
         )
