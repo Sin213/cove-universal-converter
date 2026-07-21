@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -608,6 +609,10 @@ class MainWindow(QMainWindow):
         self._output_dir: Path | None = None
         self._settings: ConversionSettings = load_settings()
 
+        # Prime the GPU-encoder probes off the UI thread so the quality
+        # dialog (opened lazily and modally) reads cached verdicts instantly.
+        threading.Thread(target=self._warm_hwaccel, daemon=True).start()
+
         # Tracked by row identity (not index) so Clear Failed during an
         # in-flight conversion can't shift indices out from under live
         # worker callbacks.
@@ -1095,6 +1100,16 @@ class MainWindow(QMainWindow):
         # Parented dialogs survive as hidden children of the window until
         # it dies; long sessions would accumulate one per open.
         dialog.deleteLater()
+
+    @staticmethod
+    def _warm_hwaccel() -> None:
+        # Best-effort: any probe failure is cached as unavailable and must
+        # never crash the startup thread.
+        try:
+            from cove_converter.engines import hwaccel
+            hwaccel.warm_cache()
+        except Exception:
+            pass
 
     def _show_quality_dialog(self) -> None:
         # Enhance-PDF moved to a per-row inline checkbox (visible whenever a

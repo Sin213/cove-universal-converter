@@ -20,6 +20,14 @@ VIDEO_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast",
                  "medium", "slow", "slower", "veryslow")
 AUDIO_BITRATES = (96, 128, 160, 192, 256, 320)
 
+# Video encoder preference. Independent of use_custom_quality: a hardware
+# choice always applies (like max_concurrent). Unavailable vendors fall back
+# to CPU inside the engine, so forcing one never fails a job.
+ENCODER_KEYS = ("auto", "cpu", "nvenc", "amf")
+ENCODER_OPTIONS = ("Automatic", "CPU", "NVIDIA (NVENC)", "AMD (AMF)")
+ENCODER_KEY_MAP = dict(zip(ENCODER_OPTIONS, ENCODER_KEYS))
+ENCODER_LABEL_MAP = dict(zip(ENCODER_KEYS, ENCODER_OPTIONS))
+
 # Near-lossless fallbacks used when the user hasn't opted into custom quality.
 _DEFAULT_VIDEO_CRF    = 17
 _DEFAULT_VIDEO_PRESET = "slow"
@@ -45,6 +53,10 @@ class ConversionSettings:
 
     # Batch concurrency is independent of the quality toggle.
     max_concurrent: int = 3
+
+    # Hardware video encoder preference (auto/cpu/nvenc/amf). Independent of
+    # the quality toggle; always applies. Only affects H.264/H.265 outputs.
+    encoder_pref: str = "auto"
 
     # PDF-specific. Off by default — Cove apps must never auto-degrade user
     # files. Only honoured by the pdf→pdf branch in PdfWorker.
@@ -77,6 +89,7 @@ class ConversionSettings:
         qs.setValue("jpeg_quality", self.jpeg_quality)
         qs.setValue("webp_quality", self.webp_quality)
         qs.setValue("max_concurrent", self.max_concurrent)
+        qs.setValue("encoder_pref", self.encoder_pref)
         qs.endGroup()
 
 
@@ -106,11 +119,15 @@ def load_settings() -> ConversionSettings:
         jpeg_quality=_stored_int(qs, "jpeg_quality", defaults.jpeg_quality, 1, 100),
         webp_quality=_stored_int(qs, "webp_quality", defaults.webp_quality, 1, 100),
         max_concurrent=_stored_int(qs, "max_concurrent", defaults.max_concurrent, 1, 16),
+        encoder_pref=str(qs.value("encoder_pref", defaults.encoder_pref)),
     )
     qs.endGroup()
     # Clamp video_preset to valid values in case stored value is stale.
     if s.video_preset not in VIDEO_PRESETS:
         s.video_preset = defaults.video_preset
+    # Fall back to auto on an unknown/hand-edited encoder preference.
+    if s.encoder_pref not in ENCODER_KEYS:
+        s.encoder_pref = defaults.encoder_pref
     return s
 
 

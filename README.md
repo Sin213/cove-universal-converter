@@ -154,6 +154,11 @@ Features:
 - Near-lossless quality by default (CRF 17, preset slow, 320 kbps audio, 95%
   JPEG/WebP). An opt-in "Customize quality settings" checkbox exposes sliders
   if you'd rather trade quality for smaller files.
+- Hardware video encoding: a "Video encoder" choice (Automatic / CPU /
+  NVIDIA NVENC / AMD AMF) offloads H.264 conversions (MP4/MKV/MOV/FLV/M4V/
+  3GP/TS) to a supported GPU for a large speed-up. Unavailable vendors are
+  greyed out and unsupported outputs (VP9, etc.) always stay on CPU; a
+  forced-but-missing GPU falls back to CPU without failing the job.
 - Real-time progress bars parsed from FFmpeg's output.
 - Overwrite confirmation with optional auto-rename to `file (1).ext`, `file (2).ext`, …
 - Right-click a row (or press Delete) to remove it from the queue.
