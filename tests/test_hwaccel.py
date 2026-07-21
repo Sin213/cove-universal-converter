@@ -37,7 +37,10 @@ def _build(out_ext: str, settings: ConversionSettings) -> list[str]:
     w.status = mock.Mock()
     w.finished_ok = mock.Mock()
     w.failed = mock.Mock()
-    return w._build_cmd()
+    # _build_cmd resolves the ffmpeg path up front; stub it so these arg-only
+    # assertions run on CI runners that have no ffmpeg installed.
+    with mock.patch("cove_converter.engines.ffmpeg.resolve", lambda name: name):
+        return w._build_cmd()
 
 
 class DetectionGracefulFailure(unittest.TestCase):
