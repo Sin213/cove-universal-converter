@@ -117,7 +117,7 @@ def _enhance_scanned_pdf(
     if src.resolve() == dst.resolve():
         raise RuntimeError("Refusing to enhance PDF in place")
 
-    import pypdfium2 as pdfium
+    import pypdfium2 as pdfium  # type: ignore[import-untyped]
 
     if progress:
         progress(5)
@@ -146,18 +146,25 @@ def _enhance_scanned_pdf(
                 return
 
             page = pdf[i]
-            bitmap = page.render(scale=scale)
             try:
-                pil = bitmap.to_pil()
+                bitmap = page.render(scale=scale)
+                try:
+                    pil = bitmap.to_pil()
+                finally:
+                    bitmap.close()
             finally:
-                bitmap.close()
-            page.close()
-
-            pil = _enhance_page(pil)
-            if pil.mode != "RGB":
-                pil = pil.convert("RGB")
+                page.close()
 
             try:
+                enhanced = _enhance_page(pil)
+                if enhanced is not pil:
+                    pil.close()
+                    pil = enhanced
+                if pil.mode != "RGB":
+                    converted = pil.convert("RGB")
+                    pil.close()
+                    pil = converted
+
                 # First save creates ``dst`` (mkstemp pre-allocated an empty
                 # file in the lifecycle path; PIL's "w+b" truncates it).
                 # Every page after the first is appended in place, so the
@@ -216,11 +223,22 @@ def _image_to_pdf(
         )
         if has_transparency:
             background = Image.new("RGB", img.size, (255, 255, 255))
-            rgba = img.convert("RGBA")
-            background.paste(rgba, mask=rgba.split()[-1])
+            try:
+                with img.convert("RGBA") as rgba:
+                    alpha = rgba.getchannel("A")
+                    try:
+                        background.paste(rgba, mask=alpha)
+                    finally:
+                        alpha.close()
+            except Exception:
+                background.close()
+                raise
+            img.close()
             img = background
         elif img.mode != "RGB":
-            img = img.convert("RGB")
+            converted = img.convert("RGB")
+            img.close()
+            img = converted
 
         if progress:
             progress(60)
@@ -317,7 +335,7 @@ def _pandoc_to_html(input_path: Path) -> str:
 
 
 def _html_to_pdf(html_source: str, output_path: Path) -> None:
-    from xhtml2pdf import pisa
+    from xhtml2pdf import pisa  # type: ignore[import-untyped]
 
     with output_path.open("wb") as f:
         result = pisa.CreatePDF(src=html_source, dest=f, encoding="utf-8")
@@ -374,7 +392,7 @@ def _pdf_to_cbz(
     """Render every page of ``src`` to PNG and pack them into a CBZ (ZIP) at ``dst``."""
     import io
 
-    import pypdfium2 as pdfium
+    import pypdfium2 as pdfium  # type: ignore[import-untyped]
 
     if progress:
         progress(5)
@@ -403,20 +421,25 @@ def _pdf_to_cbz(
                 if cancelled and cancelled():
                     return
                 page = pdf[i]
-                bitmap = page.render(scale=scale)
                 try:
-                    pil = bitmap.to_pil()
+                    bitmap = page.render(scale=scale)
+                    try:
+                        pil = bitmap.to_pil()
+                    finally:
+                        bitmap.close()
                 finally:
-                    bitmap.close()
-                page.close()
+                    page.close()
 
-                buf = io.BytesIO()
-                pil.save(buf, "PNG")
-                pil.close()
-                del pil
-
-                zf.writestr(f"{str(i + 1).zfill(pad)}.png", buf.getvalue())
-                buf.close()
+                try:
+                    with io.BytesIO() as buf:
+                        pil.save(buf, "PNG")
+                        zf.writestr(
+                            f"{str(i + 1).zfill(pad)}.png",
+                            buf.getvalue(),
+                        )
+                finally:
+                    pil.close()
+                    del pil
 
                 if progress:
                     progress(5 + int(90 * (i + 1) / n))

@@ -7,24 +7,27 @@ We use ``openpyxl`` for XLSX I/O and the stdlib ``csv`` module for CSV.
 The XLSX side picks the active sheet and dumps every row's values; formulae,
 formatting, and merged cells are intentionally not preserved (the goal is a
 plain-data round-trip, not a faithful workbook clone)."""
+
 from __future__ import annotations
 
 import csv
 import io
 import re
 import sys
+import threading
 from pathlib import Path
 
 from cove_converter.engines.base import BaseConverterWorker
 
-
-# Excel forbids these characters in sheet titles (and also caps length at 31).
-_INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
+# Excel forbids these characters and XML cannot represent C0 controls.
+_INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\\x00-\x1f]")
 
 # Leading characters that spreadsheet apps treat as formula triggers. Cells
 # beginning with any of these must be written as explicit strings so a
 # malicious CSV can't smuggle a formula into the resulting XLSX.
 _FORMULA_TRIGGERS = ("=", "+", "-", "@")
+_FORMULA_LEADING_WHITESPACE = "\t\r\n\f\v"
+_CSV_FIELD_SIZE_LOCK = threading.Lock()
 
 
 def _sanitize_sheet_title(stem: str) -> str:
@@ -33,7 +36,8 @@ def _sanitize_sheet_title(stem: str) -> str:
     Replaces characters Excel rejects (``[``, ``]``, ``:``, ``*``, ``?``,
     ``/``, ``\\``) with ``_``, enforces the 31-character cap, and falls back
     to ``Sheet1`` if nothing usable remains."""
-    cleaned = _INVALID_SHEET_CHARS.sub("_", stem)[:31]
+    # Excel also rejects apostrophes at either edge of a worksheet title.
+    cleaned = _INVALID_SHEET_CHARS.sub("_", stem).strip("'")[:31].rstrip("'")
     return cleaned or "Sheet1"
 
 
@@ -42,6 +46,10 @@ def _read_csv_text(path: Path) -> str:
     # Western Windows is CP1252). Same fallback chain as the subtitle engine;
     # latin-1 is the never-fails last resort.
     raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return raw.decode("utf-32")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
     for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
             return raw.decode(encoding)
@@ -51,40 +59,53 @@ def _read_csv_text(path: Path) -> str:
 
 
 def _csv_to_xlsx(input_path: Path, output_path: Path) -> None:
-    from openpyxl import Workbook
+    from openpyxl import Workbook  # type: ignore[import-untyped]
 
     wb = Workbook()
     ws = wb.active
     ws.title = _sanitize_sheet_title(input_path.stem)
 
-    # Lift the default 128 KiB per-field cap; large text cells are legal
-    # CSV. The module stores the limit in a C long, so sys.maxsize
-    # overflows on Windows - halve until accepted.
-    limit = sys.maxsize
-    while True:
-        try:
-            csv.field_size_limit(limit)
-            break
-        except OverflowError:
-            limit //= 2
-    with io.StringIO(_read_csv_text(input_path), newline="") as f:
-        reader = csv.reader(f)
-        for row_idx, row in enumerate(reader, start=1):
-            for col_idx, value in enumerate(row, start=1):
-                cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                # CSV gives us only strings. openpyxl auto-converts any
-                # value starting with "=" into a formula cell; the other
-                # trigger chars stay as strings but spreadsheet apps still
-                # treat them as formula entry points. Pin data_type to "s"
-                # so the XLSX cell is unambiguously text.
-                if (
-                    isinstance(value, str)
-                    and value
-                    and value[0] in _FORMULA_TRIGGERS
-                ):
-                    cell.data_type = "s"
+    try:
+        # field_size_limit is process-global, so serialize readers while it is
+        # raised to prevent concurrent CSV jobs from restoring each other's
+        # limits mid-parse.
+        with _CSV_FIELD_SIZE_LOCK:
+            previous_limit = csv.field_size_limit()
+            try:
+                # Lift the default 128 KiB per-field cap; large text cells are
+                # legal CSV. The module stores the limit in a C long, so
+                # sys.maxsize overflows on Windows - halve until accepted.
+                limit = sys.maxsize
+                while True:
+                    try:
+                        csv.field_size_limit(limit)
+                        break
+                    except OverflowError:
+                        limit //= 2
+                with io.StringIO(_read_csv_text(input_path), newline="") as f:
+                    reader = csv.reader(f)
+                    for row_idx, row in enumerate(reader, start=1):
+                        for col_idx, value in enumerate(row, start=1):
+                            cell = ws.cell(
+                                row=row_idx, column=col_idx, value=value
+                            )
+                            # CSV gives us only strings. Pin formula-like
+                            # values to text so spreadsheet apps cannot execute
+                            # them.
+                            if _is_formula_like(value):
+                                cell.data_type = "s"
+            finally:
+                csv.field_size_limit(previous_limit)
+        wb.save(str(output_path))
+    finally:
+        wb.close()
 
-    wb.save(str(output_path))
+
+def _is_formula_like(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    candidate = value.lstrip(_FORMULA_LEADING_WHITESPACE)
+    return bool(candidate) and candidate[0] in _FORMULA_TRIGGERS
 
 
 def _csv_escape_formula(value):
@@ -93,13 +114,13 @@ def _csv_escape_formula(value):
     # Excel/LibreOffice on open. Prefix a single apostrophe so spreadsheet
     # apps treat the value as literal text. Non-string and non-dangerous
     # values pass through unchanged.
-    if isinstance(value, str) and value and value[0] in _FORMULA_TRIGGERS:
+    if _is_formula_like(value):
         return "'" + value
     return value
 
 
 def _xlsx_to_csv(input_path: Path, output_path: Path) -> None:
-    from openpyxl import load_workbook
+    from openpyxl import load_workbook  # type: ignore[import-untyped]
 
     # ``data_only=True`` returns cached formula results; cells whose formulas
     # have never been evaluated by Excel/LibreOffice come back as ``None``.
@@ -118,9 +139,14 @@ def _xlsx_to_csv(input_path: Path, output_path: Path) -> None:
             for value_row, formula_row in zip(
                 ws_values.iter_rows(values_only=True),
                 ws_formulas.iter_rows(values_only=True),
+                strict=True,
             ):
                 out_row = []
-                for value_cell, formula_cell in zip(value_row, formula_row):
+                for value_cell, formula_cell in zip(
+                    value_row,
+                    formula_row,
+                    strict=True,
+                ):
                     if value_cell is not None:
                         out_row.append(_csv_escape_formula(value_cell))
                     elif isinstance(formula_cell, str) and formula_cell.startswith("="):

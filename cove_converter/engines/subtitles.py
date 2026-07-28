@@ -20,11 +20,10 @@ from pathlib import Path
 from cove_converter.engines.base import BaseConverterWorker
 
 
-_TS_SRT = re.compile(
-    r"(\d{2}:\d{2}:\d{2}),(\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}),(\d{3})",
-)
-_TS_VTT = re.compile(
-    r"(\d{2}:\d{2}:\d{2})\.(\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2})\.(\d{3})",
+_SRT_TS = r"(\d{2,}:\d{2}:\d{2}),(\d{3})"
+_TS_SRT_LINE = re.compile(
+    rf"^{_SRT_TS}\s*-->\s*{_SRT_TS}([^\r\n]*)$",
+    re.MULTILINE,
 )
 # Full VTT timing line including any trailing cue settings (align:, line:,
 # position:, size:, vertical:, region:). SRT does not support cue settings,
@@ -33,9 +32,10 @@ _TS_VTT = re.compile(
 # WebVTT permits both `HH:MM:SS.mmm` and the hourless `MM:SS.mmm` forms; SRT
 # requires the full `HH:MM:SS,mmm` form, so hourless timestamps are padded
 # with `00:` in the substitution below.
-_VTT_TS = r"((?:\d{2}:)?\d{2}:\d{2})\.(\d{3})"
+_VTT_TS = r"((?:\d{2,}:)?\d{2}:\d{2})\.(\d{3})"
 _TS_VTT_LINE = re.compile(
-    rf"{_VTT_TS}\s*-->\s*{_VTT_TS}[^\n]*",
+    rf"^{_VTT_TS}\s*-->\s*{_VTT_TS}[^\r\n]*$",
+    re.MULTILINE,
 )
 
 
@@ -48,8 +48,13 @@ def _read_text(path: Path) -> str:
     # Subtitle files are typically UTF-8 but legacy Windows-1252 is common.
     # `errors='replace'` is preferable to crashing on a stray byte.
     raw = path.read_bytes()
-    # UTF-16 first: it has an unambiguous BOM, and without this check the
-    # latin-1 fallback below would "succeed" and produce NUL-riddled garbage.
+    # Check UTF-32 before UTF-16 because little-endian UTF-32 shares UTF-16's
+    # first two BOM bytes.
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        try:
+            return raw.decode("utf-32")
+        except UnicodeDecodeError:
+            pass
     # UTF-16 SRTs are common from Windows tools.
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         try:
@@ -68,14 +73,18 @@ def _srt_to_vtt(text: str) -> str:
     # Normalize line endings, then convert ',' → '.' in timestamps and
     # strip the optional cue-index lines.
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    text = _TS_SRT.sub(r"\1.\2 --> \3.\4", text)
-
     cleaned_blocks: list[str] = []
     for block in text.split("\n\n"):
         lines = block.split("\n")
         # Drop a leading numeric-only "1" / "2" / … cue-index line.
         if lines and lines[0].strip().isdigit():
             lines = lines[1:]
+        if lines and _TS_SRT_LINE.fullmatch(lines[0]):
+            lines[0] = _TS_SRT_LINE.sub(
+                r"\1.\2 --> \3.\4\5",
+                lines[0],
+                count=1,
+            )
         if lines:
             cleaned_blocks.append("\n".join(lines))
 
@@ -103,8 +112,6 @@ def _vtt_to_srt(text: str) -> str:
             f"{_vtt_to_srt_ts(end_main)},{end_ms}"
         )
 
-    text = _TS_VTT_LINE.sub(_rewrite, text)
-
     out_blocks: list[str] = []
     index = 1
     for raw_block in text.split("\n\n"):
@@ -122,10 +129,15 @@ def _vtt_to_srt(text: str) -> str:
             continue
         # Skip the optional cue identifier (a non-timestamp line before
         # the timestamp line).
-        if "-->" not in lines[0] and len(lines) > 1 and "-->" in lines[1]:
+        if (
+            not _TS_VTT_LINE.fullmatch(lines[0])
+            and len(lines) > 1
+            and _TS_VTT_LINE.fullmatch(lines[1])
+        ):
             lines = lines[1:]
-        if "-->" not in lines[0]:
+        if not _TS_VTT_LINE.fullmatch(lines[0]):
             continue
+        lines[0] = _TS_VTT_LINE.sub(_rewrite, lines[0], count=1)
         out_blocks.append(f"{index}\n" + "\n".join(lines))
         index += 1
 

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from cove_converter.routing import effective_stem
+from cove_converter.routing import effective_stem, effective_suffix
+
+if TYPE_CHECKING:
+    from cove_converter.engines.base import BaseConverterWorker
 
 
 @dataclass(eq=False)
@@ -12,7 +16,7 @@ class FileRow:
     target_ext: str
     status: str = "Pending"
     progress: int = 0
-    worker: object | None = field(default=None, repr=False)
+    worker: BaseConverterWorker | None = field(default=None, repr=False)
     # If set, overrides the computed path (used when the user chose to
     # rename duplicates in the overwrite-confirm dialog).
     override_output: Path | None = None
@@ -53,7 +57,11 @@ def unique_path(path: Path, reserved: set[Path] | None = None) -> Path:
     reserved = reserved or set()
     if not path.exists() and path not in reserved:
         return path
-    stem, suffix, parent = path.stem, path.suffix, path.parent
+    stem, parent = effective_stem(path), path.parent
+    routed_suffix = effective_suffix(path)
+    # Keep the caller's original suffix casing while treating recognised
+    # compound extensions (for example ``.tar.gz``) as one extension.
+    suffix = path.name[-len(routed_suffix):] if routed_suffix else ""
     for i in range(1, 1000):
         candidate = parent / f"{stem} ({i}){suffix}"
         if not candidate.exists() and candidate not in reserved:

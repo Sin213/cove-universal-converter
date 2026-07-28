@@ -89,6 +89,23 @@ def hw_encode_args(encoder: str, crf: int) -> list[str]:
 
 _LOSSLESS_AUDIO = {"pcm_s16le", "pcm_s16be", "flac"}
 
+
+def _audio_encode_args(codec: str, bitrate_kbps: int) -> list[str]:
+    args = ["-c:a", codec]
+    if codec in _LOSSLESS_AUDIO:
+        return args
+
+    if codec == "libopus":
+        bitrate_kbps = min(bitrate_kbps, 256)
+    elif codec == "libvorbis":
+        # Vorbis cannot encode the low sample rates used by formats such as
+        # AMR-NB, and libvorbis rejects very high rates for mono input.
+        args += ["-ar", "44100"]
+        bitrate_kbps = min(bitrate_kbps, 192)
+
+    return [*args, "-b:a", f"{bitrate_kbps}k"]
+
+
 # WebM defaults. VP9's CRF scale runs hotter than x264's: the near-lossless
 # x264 default (CRF 17) translates to roughly VP9 CRF 24 and bloats typical
 # web-source MP4s by 5-10x. CRF 32 still inflates 1080p sources (~1.5x on an
@@ -135,9 +152,7 @@ class FFmpegWorker(BaseConverterWorker):
 
         if out_ext in _AUDIO_ONLY_EXTS:
             codec = _AUDIO_CODEC.get(out_ext, "aac")
-            cmd += ["-vn", "-c:a", codec]
-            if codec not in _LOSSLESS_AUDIO:
-                cmd += ["-b:a", f"{abr}k"]
+            cmd += ["-vn", *_audio_encode_args(codec, abr)]
             cmd += [str(self.output_path)]
             return cmd
 
@@ -172,7 +187,7 @@ class FFmpegWorker(BaseConverterWorker):
         elif vcodec == "libvpx-vp9":
             vp9_crf = s.video_crf if s.use_custom_quality else _WEBM_DEFAULT_VP9_CRF
             cmd += ["-c:v", vcodec, "-crf", str(vp9_crf), "-b:v", "0",
-                    "-row-mt", "1", "-pix_fmt", "yuv420p"]
+                    "-row-mt", "1", *_EVEN_SCALE_ARGS]
             if not s.use_custom_quality:
                 # Default path: keep encode time sane and avoid the
                 # near-lossless "best" deadline that bloats output.
@@ -182,11 +197,11 @@ class FFmpegWorker(BaseConverterWorker):
             # a quality flag they fall back to an uncontrolled default
             # bitrate. Map the CRF setting (0-51) onto qscale 2-31.
             qv = max(2, min(31, round(s.effective_video_crf() / 3)))
-            cmd += ["-c:v", vcodec, "-q:v", str(qv)]
+            cmd += ["-c:v", vcodec, "-q:v", str(qv), *_EVEN_SCALE_ARGS]
         if acodec == "libopus" and not s.use_custom_quality:
-            cmd += ["-c:a", "libopus", "-b:a", f"{_WEBM_DEFAULT_OPUS_KBPS}k"]
+            cmd += _audio_encode_args("libopus", _WEBM_DEFAULT_OPUS_KBPS)
         else:
-            cmd += ["-c:a", acodec, "-b:a", f"{abr}k"]
+            cmd += _audio_encode_args(acodec, abr)
         cmd += [str(self.output_path)]
         return cmd
 
@@ -204,8 +219,13 @@ class FFmpegWorker(BaseConverterWorker):
         )
         total_seconds: float | None = None
 
-        assert proc.stderr is not None
-        for line in proc.stderr:
+        stderr = proc.stderr
+        if stderr is None:
+            proc.terminate()
+            proc.wait()
+            raise RuntimeError("ffmpeg did not provide a stderr stream")
+
+        for line in stderr:
             if self._cancel:
                 proc.terminate()
                 break

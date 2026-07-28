@@ -32,15 +32,85 @@ import shutil
 import stat
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from .system_open import open_url as _open_url
+
+
+_API_HOSTS = frozenset({"api.github.com"})
+_ASSET_HOSTS = frozenset({
+    "github.com",
+    "github-releases.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+})
+_MAX_RELEASE_JSON_BYTES = 2 * 1024 * 1024
+_MAX_SIDECAR_BYTES = 1024 * 1024
+
+
+def _validate_repo(repo: str) -> tuple[str, str]:
+    parts = repo.split("/")
+    if (
+        len(parts) != 2
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(
+            not all(char.isascii() and (char.isalnum() or char in "._-") for char in part)
+            for part in parts
+        )
+    ):
+        raise ValueError("invalid GitHub repository name")
+    return parts[0], parts[1]
+
+
+def _validate_https_url(url: str, allowed_hosts: frozenset[str]) -> None:
+    if not isinstance(url, str) or any(ord(char) < 32 or ord(char) == 127 for char in url):
+        raise ValueError("invalid URL")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid URL") from exc
+    hostname = parsed.hostname.casefold() if parsed.hostname else ""
+    if (
+        parsed.scheme.casefold() != "https"
+        or hostname not in allowed_hosts
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        raise ValueError("untrusted URL")
+
+
+class _TrustedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allowed_hosts: frozenset[str]) -> None:
+        super().__init__()
+        self._allowed_hosts = allowed_hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_https_url(newurl, self._allowed_hosts)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_trusted(
+    request: urllib.request.Request,
+    timeout: float,
+    allowed_hosts: frozenset[str],
+):
+    _validate_https_url(request.full_url, allowed_hosts)
+    opener = urllib.request.build_opener(_TrustedRedirectHandler(allowed_hosts))
+    response = opener.open(request, timeout=timeout)  # nosec B310
+    try:
+        _validate_https_url(response.geturl(), allowed_hosts)
+    except Exception:
+        response.close()
+        raise
+    return response
 
 
 @dataclass
@@ -104,9 +174,18 @@ def bundle_kind() -> str:
     return "source"
 
 
-def preferred_asset(kind: str, assets: list[dict]) -> dict | None:
+def preferred_asset(kind: str, assets: list[object]) -> dict | None:
     def first_match(predicate) -> dict | None:
-        return next((a for a in assets if predicate(a["name"].lower())), None)
+        return next(
+            (
+                asset
+                for asset in assets
+                if isinstance(asset, dict)
+                and isinstance(asset.get("name"), str)
+                and predicate(asset["name"].lower())
+            ),
+            None,
+        )
 
     if kind == "appimage":
         return first_match(lambda n: n.endswith(".appimage"))
@@ -120,16 +199,21 @@ def preferred_asset(kind: str, assets: list[dict]) -> dict | None:
 
 
 def fetch_latest_release(repo: str, timeout: float = 8.0) -> dict | None:
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/releases/latest",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": f"{repo.split('/')[-1]}-updater",
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.load(resp)
+        owner, name = _validate_repo(repo)
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{owner}/{name}/releases/latest",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"{name}-updater",
+            },
+        )
+        with _open_trusted(req, timeout, _API_HOSTS) as resp:
+            body = resp.read(_MAX_RELEASE_JSON_BYTES + 1)
+        if len(body) > _MAX_RELEASE_JSON_BYTES:
+            return None
+        data = json.loads(body)
+        return data if isinstance(data, dict) else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -158,25 +242,41 @@ class UpdateCheckWorker(QObject):
         if data is None:
             self.failed.emit("could not reach the releases API")
             return
-        tag = data.get("tag_name") or ""
-        if not tag:
+        tag = data.get("tag_name")
+        if not isinstance(tag, str) or not tag:
             self.failed.emit("release had no tag_name")
             return
         latest = tag.lstrip("vV")
         if not version_newer(latest, self._current):
             self.noUpdate.emit()
             return
-        assets = data.get("assets") or []
+        assets = data.get("assets")
+        if not isinstance(assets, list):
+            assets = []
         asset = preferred_asset(bundle_kind(), assets)
+        asset_name = asset.get("name") if asset else None
+        asset_url = asset.get("browser_download_url") if asset else None
+        asset_size = asset.get("size", 0) if asset else 0
+        if not isinstance(asset_name, str) or not isinstance(asset_url, str):
+            asset_name = None
+            asset_url = None
+            asset_size = 0
+        else:
+            try:
+                _validate_https_url(asset_url, _ASSET_HOSTS)
+                asset_size = max(0, int(asset_size))
+            except (TypeError, ValueError):
+                asset_name = None
+                asset_url = None
+                asset_size = 0
+        owner, name = _validate_repo(self._repo)
+        release_tag = urllib.parse.quote(tag, safe="")
         info = UpdateInfo(
             latest_version=latest,
-            release_url=(
-                data.get("html_url")
-                or f"https://github.com/{self._repo}/releases/tag/{tag}"
-            ),
-            asset_name=asset["name"] if asset else None,
-            asset_url=asset["browser_download_url"] if asset else None,
-            asset_size=int(asset["size"]) if asset else 0,
+            release_url=f"https://github.com/{owner}/{name}/releases/tag/{release_tag}",
+            asset_name=asset_name,
+            asset_url=asset_url,
+            asset_size=asset_size,
         )
         self.updateAvailable.emit(info)
 
@@ -207,12 +307,16 @@ def _parse_sidecar(text: str, asset_name: str) -> str | None:
 
 
 def _fetch_sidecar(url: str, repo: str, timeout: float = 20.0) -> str:
+    _, name = _validate_repo(repo)
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": f"{repo.split('/')[-1]}-updater"},
+        headers={"User-Agent": f"{name}-updater"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    with _open_trusted(req, timeout, _ASSET_HOSTS) as resp:
+        body = resp.read(_MAX_SIDECAR_BYTES + 1)
+    if len(body) > _MAX_SIDECAR_BYTES:
+        raise ValueError("checksum sidecar is too large")
+    return body.decode("utf-8", errors="replace")
 
 
 def _hash_file(path: Path, chunk: int = 262144) -> str:
@@ -262,11 +366,12 @@ class DownloadWorker(QObject):
 
     def run(self) -> None:
         try:
+            _, repo_name = _validate_repo(self._repo)
             req = urllib.request.Request(
                 self._url,
-                headers={"User-Agent": f"{self._repo.split('/')[-1]}-updater"},
+                headers={"User-Agent": f"{repo_name}-updater"},
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _open_trusted(req, 20, _ASSET_HOSTS) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 written = 0
                 self._dest.parent.mkdir(parents=True, exist_ok=True)
@@ -303,7 +408,10 @@ class DownloadWorker(QObject):
             self.failed.emit(str(exc))
 
     def _verify_checksum(self) -> None:
-        sidecar_url = f"{self._url}.sha256"
+        parsed_url = urllib.parse.urlsplit(self._url)
+        sidecar_url = urllib.parse.urlunsplit(
+            parsed_url._replace(path=f"{parsed_url.path}.sha256")
+        )
         try:
             body = _fetch_sidecar(sidecar_url, self._repo)
         except Exception as exc:  # noqa: BLE001
@@ -455,8 +563,12 @@ class UpdateController(QObject):
         worker.updateAvailable.connect(thread.quit)
         worker.noUpdate.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        worker.updateAvailable.connect(self._on_update_available, Qt.QueuedConnection)
-        thread.finished.connect(self._on_check_done, Qt.QueuedConnection)
+        worker.updateAvailable.connect(
+            self._on_update_available, Qt.ConnectionType.QueuedConnection
+        )
+        thread.finished.connect(
+            self._on_check_done, Qt.ConnectionType.QueuedConnection
+        )
         self._thread = thread
         self._worker = worker
         thread.start()
@@ -476,7 +588,7 @@ class UpdateController(QObject):
         can_auto_install = kind == "appimage" and bool(info.asset_url)
 
         msg = QMessageBox(self._parent)
-        msg.setIcon(QMessageBox.Information)
+        msg.setIcon(QMessageBox.Icon.Information)
         msg.setWindowTitle(f"{self._display_name} — update available")
         msg.setText(
             f"{self._display_name} v{info.latest_version} is available.\n"
@@ -487,16 +599,22 @@ class UpdateController(QObject):
                 f"{info.asset_name} ({info.asset_size // (1024 * 1024)} MB). "
                 "The app will restart after the update.",
             )
-            install_btn = msg.addButton("Update now", QMessageBox.AcceptRole)
-            open_btn = msg.addButton("View release", QMessageBox.HelpRole)
-            msg.addButton("Later", QMessageBox.RejectRole)
+            install_btn = msg.addButton(
+                "Update now", QMessageBox.ButtonRole.AcceptRole
+            )
+            open_btn = msg.addButton(
+                "View release", QMessageBox.ButtonRole.HelpRole
+            )
+            msg.addButton("Later", QMessageBox.ButtonRole.RejectRole)
         else:
             msg.setInformativeText(
                 "Open the release page to download the latest installer.",
             )
             install_btn = None
-            open_btn = msg.addButton("View release", QMessageBox.AcceptRole)
-            msg.addButton("Later", QMessageBox.RejectRole)
+            open_btn = msg.addButton(
+                "View release", QMessageBox.ButtonRole.AcceptRole
+            )
+            msg.addButton("Later", QMessageBox.ButtonRole.RejectRole)
         msg.exec()
         clicked = msg.clickedButton()
         if install_btn is not None and clicked is install_btn:
@@ -541,16 +659,24 @@ class UpdateController(QObject):
         # cancel() would never be delivered until the download had already
         # finished. cancel() only sets a bool, so calling it from the GUI
         # thread is safe.
-        self._progress.canceled.connect(worker.cancel, Qt.DirectConnection)
-        worker.progress.connect(self._progress.setValue, Qt.QueuedConnection)
+        self._progress.canceled.connect(
+            worker.cancel, Qt.ConnectionType.DirectConnection
+        )
+        worker.progress.connect(
+            self._progress.setValue, Qt.ConnectionType.QueuedConnection
+        )
         # Bind the worker into the slot: reading self._download_worker there
         # would race _on_download_thread_done clearing the pointer.
         worker.finished.connect(
             lambda new, rb, w=worker: self._on_downloaded(new, rb, w),
-            Qt.QueuedConnection,
+            Qt.ConnectionType.QueuedConnection,
         )
-        worker.failed.connect(self._on_download_failed, Qt.QueuedConnection)
-        thread.finished.connect(self._on_download_thread_done, Qt.QueuedConnection)
+        worker.failed.connect(
+            self._on_download_failed, Qt.ConnectionType.QueuedConnection
+        )
+        thread.finished.connect(
+            self._on_download_thread_done, Qt.ConnectionType.QueuedConnection
+        )
         self._download_thread = thread
         self._download_worker = worker
         thread.start()

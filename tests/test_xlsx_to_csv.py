@@ -10,15 +10,20 @@ import csv
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from cove_converter.engines.spreadsheets import (  # noqa: E402
+from cove_converter.engines.spreadsheets import (
+    _csv_escape_formula,
     _csv_to_xlsx,
+    _read_csv_text,
     _sanitize_sheet_title,
     _xlsx_to_csv,
 )
@@ -278,6 +283,86 @@ class CsvToXlsxFormulaInjection(unittest.TestCase):
             sheet_xml = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
         self.assertNotIn('t="f"', sheet_xml)
         self.assertNotIn("<f>", sheet_xml)
+
+
+class SpreadsheetInputHardening(unittest.TestCase):
+    def test_sheet_title_removes_edge_apostrophes_and_controls(self) -> None:
+        self.assertEqual(_sanitize_sheet_title("'report'"), "report")
+        self.assertEqual(_sanitize_sheet_title("a\x01b"), "a_b")
+
+    def test_formula_escape_handles_leading_control_whitespace(self) -> None:
+        for value in ("\t=1+1", "\r@SUM(A1)", "\n-1", "\f+1", "\v=2"):
+            with self.subTest(value=value):
+                self.assertEqual(_csv_escape_formula(value), "'" + value)
+
+    def test_utf32_bom_is_decoded_before_utf16(self) -> None:
+        text = "name,value\ncafé,1\n"
+        encodings = (
+            ("utf-32-le", b"\xff\xfe\x00\x00"),
+            ("utf-32-be", b"\x00\x00\xfe\xff"),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            for encoding, bom in encodings:
+                with self.subTest(encoding=encoding):
+                    path = Path(td) / f"{encoding}.csv"
+                    path.write_bytes(bom + text.encode(encoding))
+                    self.assertEqual(_read_csv_text(path), text)
+
+    def test_csv_conversion_restores_global_field_size_limit(self) -> None:
+        previous = csv.field_size_limit()
+        try:
+            csv.field_size_limit(64)
+            with tempfile.TemporaryDirectory() as td:
+                input_path = Path(td) / "in.csv"
+                output_path = Path(td) / "out.xlsx"
+                input_path.write_text("value\n", encoding="utf-8")
+                _csv_to_xlsx(input_path, output_path)
+            self.assertEqual(csv.field_size_limit(), 64)
+        finally:
+            csv.field_size_limit(previous)
+
+    def test_concurrent_csv_conversions_serialize_field_limit_changes(self) -> None:
+        from cove_converter.engines.spreadsheets import _read_csv_text as read_csv
+
+        active = 0
+        active_lock = threading.Lock()
+        overlap = threading.Event()
+
+        def tracked_read(path: Path) -> str:
+            nonlocal active
+            with active_lock:
+                active += 1
+                if active > 1:
+                    overlap.set()
+            try:
+                overlap.wait(timeout=0.2)
+                return read_csv(path)
+            finally:
+                with active_lock:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            inputs = [root / f"in-{index}.csv" for index in range(2)]
+            outputs = [root / f"out-{index}.xlsx" for index in range(2)]
+            for path in inputs:
+                path.write_text("value\n" + ("x" * 200_000) + "\n", encoding="utf-8")
+
+            with (
+                patch(
+                    "cove_converter.engines.spreadsheets._read_csv_text",
+                    new=tracked_read,
+                ),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                futures = [
+                    executor.submit(_csv_to_xlsx, input_path, output_path)
+                    for input_path, output_path in zip(inputs, outputs, strict=True)
+                ]
+                for future in futures:
+                    future.result(timeout=5)
+
+        self.assertFalse(overlap.is_set())
 
 
 if __name__ == "__main__":

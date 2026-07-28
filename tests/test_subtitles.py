@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,7 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from cove_converter.engines.subtitles import _srt_to_vtt, _vtt_to_srt  # noqa: E402
+from cove_converter.engines.subtitles import (  # noqa: E402
+    _read_text,
+    _srt_to_vtt,
+    _vtt_to_srt,
+)
 
 
 class VttToSrt(unittest.TestCase):
@@ -165,6 +170,57 @@ class SrtToVtt(unittest.TestCase):
         self.assertTrue(vtt.startswith("WEBVTT\n"))
         self.assertIn("00:00:01.000 --> 00:00:02.000", vtt)
         self.assertNotIn("\n1\n", vtt)
+
+
+class SubtitleTimestampBoundaries(unittest.TestCase):
+    def test_vtt_accepts_more_than_two_hour_digits(self) -> None:
+        vtt = "WEBVTT\n\n100:00:01.000 --> 100:00:02.000\nLong\n"
+        self.assertIn(
+            "100:00:01,000 --> 100:00:02,000",
+            _vtt_to_srt(vtt),
+        )
+
+    def test_srt_accepts_more_than_two_hour_digits(self) -> None:
+        srt = "1\n100:00:01,000 --> 100:00:02,000\nLong\n"
+        self.assertIn(
+            "100:00:01.000 --> 100:00:02.000",
+            _srt_to_vtt(srt),
+        )
+
+    def test_vtt_payload_that_looks_like_timestamp_is_unchanged(self) -> None:
+        vtt = (
+            "WEBVTT\n\n"
+            "00:00:01.000 --> 00:00:02.000\n"
+            "00:00:03.000 --> 00:00:04.000\n"
+        )
+        srt = _vtt_to_srt(vtt)
+        self.assertIn("00:00:01,000 --> 00:00:02,000", srt)
+        self.assertIn("00:00:03.000 --> 00:00:04.000", srt)
+
+    def test_srt_payload_that_looks_like_timestamp_is_unchanged(self) -> None:
+        srt = (
+            "1\n"
+            "00:00:01,000 --> 00:00:02,000\n"
+            "00:00:03,000 --> 00:00:04,000\n"
+        )
+        vtt = _srt_to_vtt(srt)
+        self.assertIn("00:00:01.000 --> 00:00:02.000", vtt)
+        self.assertIn("00:00:03,000 --> 00:00:04,000", vtt)
+
+
+class SubtitleTextEncoding(unittest.TestCase):
+    def test_utf32_bom_is_decoded_before_utf16(self) -> None:
+        text = "café"
+        encodings = (
+            ("utf-32-le", b"\xff\xfe\x00\x00"),
+            ("utf-32-be", b"\x00\x00\xfe\xff"),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            for encoding, bom in encodings:
+                with self.subTest(encoding=encoding):
+                    path = Path(td) / f"{encoding}.srt"
+                    path.write_bytes(bom + text.encode(encoding))
+                    self.assertEqual(_read_text(path), text)
 
 
 if __name__ == "__main__":

@@ -198,7 +198,7 @@ def _flatten_pdf_locked(
 ) -> None:
     # Imports are local because pypdfium2 / PIL are heavy and the module is
     # also imported for the cheap ``has_pdf_javascript`` detection path.
-    import pypdfium2 as pdfium
+    import pypdfium2 as pdfium  # type: ignore[import-untyped]
     from PIL import Image
 
     _log.info("flatten: src=%s dst=%s dpi=%d", src, dst, _RENDER_DPI)
@@ -300,7 +300,6 @@ def _flatten_pdf_locked(
                     finally:
                         bitmap.close()
                 except Exception as exc:
-                    page.close()
                     _log.error(
                         "flatten: could not render page %d/%d: %s",
                         i + 1, n, exc,
@@ -308,13 +307,15 @@ def _flatten_pdf_locked(
                     raise RuntimeError(
                         f"Could not render page {i + 1}/{n}: {exc}"
                     ) from exc
-                page.close()
-
-                if pil.mode != "RGB":
-                    pil = pil.convert("RGB")
+                finally:
+                    page.close()
 
                 page_path = Path(tmpdir) / f"page_{i:04d}.jpg"
                 try:
+                    if pil.mode != "RGB":
+                        converted = pil.convert("RGB")
+                        pil.close()
+                        pil = converted
                     pil.save(
                         str(page_path), "JPEG", quality=_JPEG_QUALITY,
                     )

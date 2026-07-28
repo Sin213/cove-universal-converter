@@ -145,10 +145,12 @@ def common_targets(extensions: Iterable[str]) -> tuple[str, ...]:
 
 def engine_for(ext_in: str, ext_out: str) -> str | None:
     """Pick the right engine considering both endpoints (PDF overrides Pandoc)."""
+    info = info_for(ext_in)
+    if info is None or ext_out.lower() not in info.targets:
+        return None
     if ext_in.lower() == ".pdf" or ext_out.lower() == ".pdf":
         return "Pdf"
-    info = info_for(ext_in)
-    return info.engine if info else None
+    return info.engine
 
 
 def effective_suffix(path: Path) -> str:

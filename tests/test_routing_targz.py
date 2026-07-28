@@ -21,8 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from cove_converter import routing  # noqa: E402
-from cove_converter.engines import archives  # noqa: E402
-from cove_converter.ui.file_row import FileRow  # noqa: E402
+from cove_converter.ui.file_row import FileRow, unique_path  # noqa: E402
 
 
 class EffectiveSuffix(unittest.TestCase):
@@ -79,6 +78,12 @@ class RoutingExposure(unittest.TestCase):
 
 
 class OutputResolution(unittest.TestCase):
+    def test_unique_path_preserves_compound_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "foo.tar.gz"
+            path.touch()
+            self.assertEqual(unique_path(path), Path(td) / "foo (1).tar.gz")
+
     def test_tar_gz_input_zip_target(self) -> None:
         row = FileRow(path=Path("/tmp/sample.tar.gz"), target_ext=".zip")
         self.assertEqual(row.resolve_output(None), Path("/tmp/sample.zip"))

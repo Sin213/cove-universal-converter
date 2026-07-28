@@ -20,6 +20,7 @@ def _log_dir() -> Path:
     lazily — failing to create it must not abort app startup, so we swallow
     any OSError and fall back to a temp dir."""
     from cove_converter.portable import is_portable, portable_data_dir
+
     if is_portable():
         return Path(portable_data_dir("cove-universal-converter"))
     base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
@@ -52,7 +53,10 @@ def _setup_logging() -> Path | None:
     try:
         log_dir = _log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "cove-converter.log"
+        # FileHandler normalizes ``baseFilename`` to an absolute path. Keep our
+        # comparison path normalized too, otherwise a relative XDG_CACHE_HOME
+        # makes repeated setup calls install duplicate file handlers.
+        log_path = (log_dir / "cove-converter.log").resolve()
         # Cap each file at 1 MB; keep 3 rotations. A failing conversion produces
         # ~2 KB of traceback so this comfortably holds many runs.
         # Idempotent: a repeated setup call must not double-write the log.
@@ -61,14 +65,16 @@ def _setup_logging() -> Path | None:
             and getattr(h, "baseFilename", None) == str(log_path)
             for h in root.handlers
         ):
-            fh = RotatingFileHandler(log_path, maxBytes=1_000_000,
-                                     backupCount=3, encoding="utf-8")
+            fh = RotatingFileHandler(
+                log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            )
             fh.setFormatter(fmt)
             root.addHandler(fh)
         logging.getLogger("cove_converter").info("log file: %s", log_path)
     except OSError as exc:
         logging.getLogger("cove_converter").warning(
-            "could not open log file: %s", exc,
+            "could not open log file: %s",
+            exc,
         )
     return log_path
 

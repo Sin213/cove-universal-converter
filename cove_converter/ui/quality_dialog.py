@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon, QPainter, QPixmap
+from PySide6.QtGui import QIcon, QPainter, QPixmap, QStandardItemModel
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -356,8 +356,14 @@ class QualityDialog(QDialog):
             key = ENCODER_KEY_MAP[label]
             # Grey out anything not confirmed available (unknown greys too, so
             # the user can't pick a vendor whose probe hasn't landed yet).
-            if key in vendor_verdict and vendor_verdict[key] is not True:
-                model.item(idx).setEnabled(False)
+            if (
+                key in vendor_verdict
+                and vendor_verdict[key] is not True
+                and isinstance(model, QStandardItemModel)
+            ):
+                item = model.item(idx)
+                if item is not None:
+                    item.setEnabled(False)
 
         pref = current_pref
         # Only discard a saved vendor preference once its probe has *completed*

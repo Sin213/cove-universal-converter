@@ -37,10 +37,11 @@ def _spawn_xdg_open(target: str) -> bool:
     env = child_env()
     if env is None or not sys.platform.startswith("linux"):
         return False
-    if not shutil.which("xdg-open"):
+    executable = shutil.which("xdg-open", path=env.get("PATH"))
+    if executable is None:
         return False
     try:
-        subprocess.Popen(["xdg-open", target], env=env)
+        subprocess.Popen([executable, target], env=env)
         return True
     except Exception:  # noqa: BLE001
         return False

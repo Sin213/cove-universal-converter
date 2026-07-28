@@ -397,7 +397,7 @@ def _validate_yaml(path: Path) -> None:
 def _validate_csv(path: Path) -> None:
     _validate_nonempty(path)
     text = path.read_text(encoding="utf-8")
-    lines = [l for l in text.splitlines() if l.strip()]
+    lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
         raise AssertionError("CSV has no rows")
 

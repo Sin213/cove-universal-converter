@@ -98,11 +98,31 @@ def _stored_int(qs: QSettings, key: str, default: int, lo: int, hi: int) -> int:
 
     A non-numeric or missing value falls back to ``default`` instead of
     crashing the app at startup; out-of-range values are clamped."""
+    raw_value = qs.value(key, default)
+    if not isinstance(raw_value, (str, bytes, bytearray, int, float)):
+        return default
     try:
-        value = int(qs.value(key, default))
-    except (TypeError, ValueError):
+        value = int(raw_value)
+    except (TypeError, ValueError, OverflowError):
         return default
     return max(lo, min(hi, value))
+
+
+def _stored_bool(qs: QSettings, key: str, default: bool) -> bool:
+    """Read a persisted bool without treating the string ``"false"`` as true."""
+    value = qs.value(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
 
 
 def load_settings() -> ConversionSettings:
@@ -111,7 +131,9 @@ def load_settings() -> ConversionSettings:
     qs = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
     qs.beginGroup(_GROUP)
     s = ConversionSettings(
-        use_custom_quality=bool(qs.value("use_custom_quality", defaults.use_custom_quality)),
+        use_custom_quality=_stored_bool(
+            qs, "use_custom_quality", defaults.use_custom_quality
+        ),
         video_crf=_stored_int(qs, "video_crf", defaults.video_crf, 0, 51),
         video_preset=str(qs.value("video_preset", defaults.video_preset)),
         audio_bitrate_kbps=_stored_int(

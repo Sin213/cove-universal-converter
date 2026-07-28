@@ -27,7 +27,6 @@ import pytest
 from PIL import Image, ImageDraw
 
 from cove_converter.engines import pdf as pdf_engine
-from cove_converter.engines import pdf_flatten
 from cove_converter.engines.pdf import PdfWorker
 from cove_converter.engines.pdf_flatten import flatten_pdf, has_pdf_javascript
 from cove_converter.settings import ConversionSettings

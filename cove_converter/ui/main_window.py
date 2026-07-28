@@ -69,7 +69,7 @@ from cove_converter.routing import (
     info_for,
     targets_for,
 )
-from cove_converter.settings import ConversionSettings, default_settings, load_settings
+from cove_converter.settings import ConversionSettings, load_settings
 from cove_converter.ui.drop_zone import DropZone
 from cove_converter.ui.file_row import FileRow, unique_path
 from cove_converter.ui.formats_dialog import FormatsDialog
@@ -146,7 +146,7 @@ _SVG_MOON = b"""<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill
  <path d='M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z'/></svg>"""
 
 
-_PIXMAP_CACHE: dict[tuple[int, int, str | None], QPixmap] = {}
+_PIXMAP_CACHE: dict[tuple[int, int, str | None, float], QPixmap] = {}
 
 
 def _screen_dpr() -> float:
@@ -546,9 +546,10 @@ class _Toast(QFrame):
         self._pip.setStyleSheet(f"background: {color}; border-radius: 3px;")
         # Anchored just below the title bar so it never overlaps the action
         # row at the bottom (which now hosts the "Show output folder" button).
-        if self.parentWidget() is not None:
+        parent = self.parentWidget()
+        if parent is not None:
             self.adjustSize()
-            pw = self.parentWidget().width()
+            pw = parent.width()
             self.move((pw - self.width()) // 2, 56)
         self.show()
         self.raise_()
@@ -779,7 +780,7 @@ class MainWindow(QMainWindow):
 
     def _on_theme_toggle(self) -> None:
         app = QApplication.instance()
-        if app is not None:
+        if isinstance(app, QApplication):
             toggle_theme(app)
 
     def _on_theme_changed(self, theme: str) -> None:
@@ -940,11 +941,11 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit(panel)
         self.log_view.setObjectName("logView")
         self.log_view.setReadOnly(True)
-        self.log_view.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.log_view.setPlaceholderText("No entries yet.")
         self.log_view.setMaximumHeight(140)
         font = QFont("monospace")
-        font.setStyleHint(QFont.TypeWriter)
+        font.setStyleHint(QFont.StyleHint.TypeWriter)
         self.log_view.setFont(font)
         panel_lay.addWidget(self.log_view)
 
@@ -1669,7 +1670,7 @@ class MainWindow(QMainWindow):
         box.setInformativeText(preview)
         overwrite_btn = box.addButton("Overwrite", QMessageBox.ButtonRole.DestructiveRole)
         rename_btn    = box.addButton("Rename duplicates", QMessageBox.ButtonRole.ActionRole)
-        cancel_btn    = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.addButton(QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(rename_btn)
         box.exec()
         clicked = box.clickedButton()
@@ -1917,21 +1918,21 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
         view = QPlainTextEdit(dlg)
         view.setReadOnly(True)
-        view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         font = QFont("monospace")
-        font.setStyleHint(QFont.TypeWriter)
+        font.setStyleHint(QFont.StyleHint.TypeWriter)
         view.setFont(font)
         view.setPlainText(log_text)
         layout.addWidget(view, 1)
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         copy_btn = QPushButton("Copy", dlg)
-        copy_btn.clicked.connect(
-            lambda: (
-                QApplication.clipboard().setText(log_text),
-                self._toast.show_message("Log copied"),
-            )
-        )
+
+        def copy_log() -> None:
+            QApplication.clipboard().setText(log_text)
+            self._toast.show_message("Log copied")
+
+        copy_btn.clicked.connect(copy_log)
         close_btn = QPushButton("Close", dlg)
         close_btn.clicked.connect(dlg.accept)
         btn_row.addWidget(copy_btn)
@@ -2039,14 +2040,22 @@ class MainWindow(QMainWindow):
         w, h = self.width(), self.height()
         x, y = pos.x(), pos.y()
         left, right, top, bottom = x <= m, x >= w - m, y <= m, y >= h - m
-        if top and left:     return Qt.Edge.TopEdge | Qt.Edge.LeftEdge
-        if top and right:    return Qt.Edge.TopEdge | Qt.Edge.RightEdge
-        if bottom and left:  return Qt.Edge.BottomEdge | Qt.Edge.LeftEdge
-        if bottom and right: return Qt.Edge.BottomEdge | Qt.Edge.RightEdge
-        if left:             return Qt.Edge.LeftEdge
-        if right:            return Qt.Edge.RightEdge
-        if top:              return Qt.Edge.TopEdge
-        if bottom:           return Qt.Edge.BottomEdge
+        if top and left:
+            return Qt.Edge.TopEdge | Qt.Edge.LeftEdge
+        if top and right:
+            return Qt.Edge.TopEdge | Qt.Edge.RightEdge
+        if bottom and left:
+            return Qt.Edge.BottomEdge | Qt.Edge.LeftEdge
+        if bottom and right:
+            return Qt.Edge.BottomEdge | Qt.Edge.RightEdge
+        if left:
+            return Qt.Edge.LeftEdge
+        if right:
+            return Qt.Edge.RightEdge
+        if top:
+            return Qt.Edge.TopEdge
+        if bottom:
+            return Qt.Edge.BottomEdge
         return None
 
     @staticmethod

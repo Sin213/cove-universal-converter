@@ -48,7 +48,14 @@ def _encoder_listed(encoder: str) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return encoder in (proc.stdout or "")
+    if proc.returncode != 0:
+        return False
+
+    return any(
+        len(fields) >= 2 and fields[1] == encoder
+        for line in (proc.stdout or "").splitlines()
+        if (fields := line.split())
+    )
 
 
 def _test_encode(encoder: str) -> bool:

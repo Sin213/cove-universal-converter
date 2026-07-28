@@ -90,7 +90,7 @@ fi
 echo "==> Verifying ffmpeg archive against pinned SHA-256"
 echo "$FF_ACTIVE_SHA256  $FF_ARCHIVE" | sha256sum -c -
 (cd "$FF_TMP" && tar -xf ffmpeg.tar.xz)
-FFMPEG_BIN="$(find "$FF_TMP" -type f -name ffmpeg | head -1)"
+FFMPEG_BIN="$(find "$FF_TMP" -type f -name ffmpeg -print -quit)"
 [ -n "$FFMPEG_BIN" ] || { echo "ffmpeg not found after extract"; exit 1; }
 
 echo "==> Fetching pandoc $PANDOC_VERSION"
@@ -102,7 +102,7 @@ curl -fL --retry 3 --silent --show-error \
 echo "==> Verifying pandoc archive against pinned SHA-256"
 echo "$PANDOC_SHA256  $PD_TMP/pandoc.tar.gz" | sha256sum -c -
 (cd "$PD_TMP" && tar -xf pandoc.tar.gz)
-PANDOC_BIN="$(find "$PD_TMP" -type f -name pandoc | head -1)"
+PANDOC_BIN="$(find "$PD_TMP" -type f -name pandoc -print -quit)"
 [ -n "$PANDOC_BIN" ] || { echo "pandoc not found after extract"; exit 1; }
 
 # ----------------------------------------------------------------------
@@ -160,7 +160,7 @@ Comment=Batch-convert video, audio, images, and documents offline
 Exec=$APP_NAME
 Icon=$APP_NAME
 Terminal=false
-Categories=AudioVideo;Video;Audio;Graphics;Office;Utility;
+Categories=Utility;FileTools;Qt;
 Keywords=convert;video;audio;image;document;pdf;ffmpeg;pandoc;
 StartupNotify=true
 EOF
@@ -246,7 +246,7 @@ Comment=Batch-convert video, audio, images, and documents offline
 Exec=$APP_NAME
 Icon=$APP_NAME
 Terminal=false
-Categories=AudioVideo;Video;Audio;Graphics;Office;Utility;
+Categories=Utility;FileTools;Qt;
 Keywords=convert;video;audio;image;document;pdf;ffmpeg;pandoc;
 StartupNotify=true
 EOF

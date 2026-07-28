@@ -19,6 +19,9 @@ from cove_converter.engines.base import BaseConverterWorker
 
 def _read_text(path: Path) -> str:
     raw = path.read_bytes()
+    # UTF-32 BOMs share their first two bytes with UTF-16, so test them first.
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return raw.decode("utf-32")
     # YAML permits UTF-16 (the spec mandates BOM detection); honour the BOM
     # instead of crashing in a utf-8 decode before the parser ever runs.
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
@@ -46,6 +49,10 @@ class JsonDuplicateKeyError(RuntimeError):
     on the way to YAML."""
 
 
+class JsonNonFiniteNumberError(RuntimeError):
+    """Raised when JSON contains a non-finite number."""
+
+
 def _json_loads_no_duplicate_keys(text: str):
     """Parse JSON, rejecting any object that repeats a key. ``object_pairs_hook``
     sees the raw key/value pairs (including duplicates) before ``dict`` would
@@ -62,7 +69,25 @@ def _json_loads_no_duplicate_keys(text: str):
             seen.add(k)
         return dict(pairs)
 
-    return json.loads(text, object_pairs_hook=_no_dupes)
+    def _reject_non_finite(value: str):
+        raise JsonNonFiniteNumberError(
+            f"JSON contains non-standard number {value!r}; refusing invalid JSON"
+        )
+
+    def _parse_finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise JsonNonFiniteNumberError(
+                f"JSON number {value!r} is outside the finite float range"
+            )
+        return parsed
+
+    return json.loads(
+        text,
+        object_pairs_hook=_no_dupes,
+        parse_constant=_reject_non_finite,
+        parse_float=_parse_finite_float,
+    )
 
 
 def _json_key(value) -> str:
@@ -123,7 +148,7 @@ def _json_safe(value):
 
 
 def _json_to_yaml(input_path: Path, output_path: Path) -> None:
-    import yaml
+    import yaml  # type: ignore[import-untyped]
 
     data = _json_loads_no_duplicate_keys(_read_text(input_path))
     with output_path.open("w", encoding="utf-8") as f:
@@ -146,7 +171,7 @@ def _build_collision_loader():
 
     Catching them here, before ``dict.__setitem__`` collapses them, is the
     only way to refuse the data instead of silently dropping a value."""
-    import yaml
+    import yaml  # type: ignore[import-untyped]
 
     class _CollisionDetectingLoader(yaml.SafeLoader):
         pass
@@ -176,7 +201,7 @@ def _build_collision_loader():
         explicit_pairs = node.value[len(node.value) - explicit_count:]
         seen_python: list = []
         seen_json: dict[str, object] = {}
-        for key_node, value_node in explicit_pairs:
+        for key_node, _value_node in explicit_pairs:
             key = loader.construct_object(key_node, deep=True)
             for prev in seen_python:
                 try:
@@ -215,12 +240,12 @@ def _build_collision_loader():
 
 
 def _yaml_to_json(input_path: Path, output_path: Path) -> None:
-    import yaml
-
     loader_cls = _build_collision_loader()
-    # `yaml.load` with a SafeLoader subclass is safe — it inherits
-    # SafeConstructor's restricted tag set.
-    data = _json_safe(yaml.load(_read_text(input_path), Loader=loader_cls))
+    loader = loader_cls(_read_text(input_path))
+    try:
+        data = _json_safe(loader.get_single_data())
+    finally:
+        loader.dispose()
     output_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",

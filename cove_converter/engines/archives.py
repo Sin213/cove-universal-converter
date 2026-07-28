@@ -17,6 +17,7 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Literal, overload
 
 from cove_converter.engines.base import BaseConverterWorker
 
@@ -39,11 +40,21 @@ def _is_tar_like(ext: str) -> bool:
     return ext in (".tar", ".tgz", ".gz")
 
 
-def _tar_mode(out_ext: str, *, write: bool) -> str:
-    base = "w" if write else "r"
-    if out_ext == ".tgz" or out_ext == ".gz":
-        return f"{base}:gz"
-    return base
+@overload
+def _tar_mode(out_ext: str, *, write: Literal[False]) -> Literal["r", "r:gz"]: ...
+
+
+@overload
+def _tar_mode(out_ext: str, *, write: Literal[True]) -> Literal["w", "w:gz"]: ...
+
+
+def _tar_mode(
+    out_ext: str, *, write: bool
+) -> Literal["r", "r:gz", "w", "w:gz"]:
+    compressed = out_ext in (".tgz", ".gz")
+    if write:
+        return "w:gz" if compressed else "w"
+    return "r:gz" if compressed else "r"
 
 
 # Extraction hits the local filesystem, so duplicate detection must model
@@ -51,8 +62,8 @@ def _tar_mode(out_ext: str, *, write: bool) -> str:
 # and macOS, and Windows additionally strips trailing dots/spaces from path
 # components. Without this, ``Foo.txt`` vs ``foo.txt`` (or ``foo.txt.``)
 # passes validation and the second extract silently overwrites the first.
-_FOLD_CASE = sys.platform.startswith("win") or sys.platform == "darwin"
-_STRIP_TRAILING = sys.platform.startswith("win")
+_FOLD_CASE = sys.platform == "win32" or sys.platform == "darwin"
+_STRIP_TRAILING = sys.platform == "win32"
 
 
 def _dedup_key(name: str) -> str:

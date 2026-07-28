@@ -231,5 +231,33 @@ class JsonDuplicateKeys(unittest.TestCase):
             self.assertEqual(payload, {"a": 1, "b": [1, 2, 3], "c": {"nested": True}})
 
 
+class JsonNonFiniteNumbers(unittest.TestCase):
+    def test_non_finite_constants_are_rejected(self) -> None:
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                payload = f'{{"value": {constant}}}'
+                with self.assertRaises(data.JsonNonFiniteNumberError):
+                    data._json_loads_no_duplicate_keys(payload)
+
+    def test_exponent_overflow_is_rejected(self) -> None:
+        with self.assertRaises(data.JsonNonFiniteNumberError):
+            data._json_loads_no_duplicate_keys('{"value": 1e400}')
+
+
+class DataTextEncoding(unittest.TestCase):
+    def test_utf32_bom_is_decoded_before_utf16(self) -> None:
+        text = "café"
+        encodings = (
+            ("utf-32-le", b"\xff\xfe\x00\x00"),
+            ("utf-32-be", b"\x00\x00\xfe\xff"),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            for encoding, bom in encodings:
+                with self.subTest(encoding=encoding):
+                    path = Path(td) / f"{encoding}.json"
+                    path.write_bytes(bom + text.encode(encoding))
+                    self.assertEqual(data._read_text(path), text)
+
+
 if __name__ == "__main__":
     unittest.main()

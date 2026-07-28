@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -229,30 +230,61 @@ class DialogPreservesUnknownPref(unittest.TestCase):
 
 
 class SettingsRoundTrip(unittest.TestCase):
-    def test_encoder_pref_survives_save_load(self) -> None:
+    def setUp(self) -> None:
         from PySide6.QtCore import QSettings
 
-        QSettings("Cove", "UniversalConverter").clear()
+        self._settings_dir = tempfile.TemporaryDirectory()
+        self._qs = QSettings(
+            str(Path(self._settings_dir.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        self._settings_patch = mock.patch(
+            "cove_converter.settings.QSettings",
+            return_value=self._qs,
+        )
+        self._settings_patch.start()
+
+    def tearDown(self) -> None:
+        self._qs.clear()
+        self._qs.sync()
+        self._settings_patch.stop()
+        self._settings_dir.cleanup()
+
+    def test_encoder_pref_survives_save_load(self) -> None:
         s = default_settings()
         s.encoder_pref = "nvenc"
         s.save()
-        try:
-            self.assertEqual(load_settings().encoder_pref, "nvenc")
-        finally:
-            QSettings("Cove", "UniversalConverter").clear()
+        self.assertEqual(load_settings().encoder_pref, "nvenc")
 
     def test_unknown_stored_value_falls_back_to_auto(self) -> None:
-        from PySide6.QtCore import QSettings
+        self._qs.beginGroup("quality")
+        self._qs.setValue("encoder_pref", "bogus")
+        self._qs.endGroup()
+        self.assertEqual(load_settings().encoder_pref, "auto")
 
-        qs = QSettings("Cove", "UniversalConverter")
-        qs.clear()
-        qs.beginGroup("quality")
-        qs.setValue("encoder_pref", "bogus")
-        qs.endGroup()
-        try:
-            self.assertEqual(load_settings().encoder_pref, "auto")
-        finally:
-            qs.clear()
+    def test_string_false_is_loaded_as_false(self) -> None:
+        self._qs.beginGroup("quality")
+        self._qs.setValue("use_custom_quality", "false")
+        self._qs.endGroup()
+        self.assertFalse(load_settings().use_custom_quality)
+
+    def test_invalid_bool_falls_back_to_default(self) -> None:
+        self._qs.beginGroup("quality")
+        self._qs.setValue("use_custom_quality", "definitely")
+        self._qs.endGroup()
+        self.assertEqual(
+            load_settings().use_custom_quality,
+            default_settings().use_custom_quality,
+        )
+
+    def test_infinite_integer_setting_falls_back_to_default(self) -> None:
+        self._qs.beginGroup("quality")
+        self._qs.setValue("video_crf", float("inf"))
+        self._qs.endGroup()
+        self.assertEqual(
+            load_settings().video_crf,
+            default_settings().video_crf,
+        )
 
 
 if __name__ == "__main__":
