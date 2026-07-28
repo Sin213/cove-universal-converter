@@ -68,5 +68,6 @@ This release fixes conversion correctness, resource cleanup, user interface edge
 
 - Apply Windows-specific archive filename rules only on actual Win32 systems.
 - Avoid `pipefail` build failures caused by executable discovery pipelines when multiple matches exist.
+- Run FFmpeg command-construction tests without requiring a host FFmpeg install, preventing clean release runners from failing before packaging.
 
 Each release artifact has a matching `.sha256` file for verification.

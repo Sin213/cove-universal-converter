@@ -44,7 +44,10 @@ def test_audio_args_keep_opus_and_vorbis_within_supported_limits() -> None:
 
 
 @pytest.mark.parametrize("suffix", [".webm", ".avi"])
-def test_video_commands_scale_odd_dimensions_to_even(suffix: str) -> None:
+def test_video_commands_scale_odd_dimensions_to_even(
+    suffix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ffmpeg_engine, "resolve", lambda _name: "ffmpeg")
     cmd = _ffmpeg_worker(suffix)._build_cmd()
 
     assert "scale=ceil(iw/2)*2:ceil(ih/2)*2" in cmd
