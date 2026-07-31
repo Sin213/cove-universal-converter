@@ -1,7 +1,8 @@
 # Cove Universal Converter
 
 An offline, privacy-first batch file converter. Drop in video, audio, images,
-or documents and convert between 40+ formats — no files leave your machine.
+documents, comics, subtitles, spreadsheets, archives, or structured data and
+convert between 120+ formats - no files leave your machine.
 
 ![Cove Universal Converter v2.0.0](docs/screenshot.png)
 
@@ -12,6 +13,47 @@ binary. Everything below assumes you're starting from a fresh clone:
 git clone https://github.com/Sin213/cove-universal-converter.git
 cd cove-universal-converter
 ```
+
+---
+
+## v2.4.0 - Expanded format coverage
+
+This release focuses on breadth: many more input and output formats across
+every engine, plus a couple of small conversion-quality controls.
+
+### New conversions in v2.4.0
+
+- **Video containers** - `.mxf`, `.rm`, `.swf`, `.vob`, `.asf`, `.ogv`,
+  `.m2ts`, `.mts`, `.f4v` now read and write like the existing containers.
+  `.y4m` and `.ivf` are new write-only targets for tools that expect raw
+  YUV4MPEG2 or IVF/VP9 elementary streams.
+- **Audio formats** - `.ac3`, `.mp2`, `.spx`, `.caf`, `.au`, `.wv`, `.voc`,
+  `.w64`, `.mka`, `.m4b`, `.oga`, `.aif`, `.tta`, `.amr`, and `.weba` join
+  the existing audio targets.
+- **Image formats** - `.jpe`, `.jfif`, `.avif`, `.jp2`/`.j2k`/`.jpx`, `.tga`,
+  `.pcx`, `.ppm`/`.pgm`/`.pbm`, `.dds`, and `.icns` are now supported inputs
+  and outputs.
+- **Documents** - many more Pandoc-backed input formats (`.rst`, `.org`,
+  `.textile`, `.typst`, `.ipynb`, `.fb2`, `.opml`, `.muse`, `.man`,
+  `.native`, `.mediawiki`, `.wiki`, `.dokuwiki`, `.jira`, `.docbook`) and
+  output formats (`.adoc`, `.tei`, `.icml`, `.pptx`).
+- **Comics - CBZ/CBT to PDF, ZIP, or TAR.** New Comic Book Archive support:
+  extracts page images and rebuilds them as a PDF, or repacks the archive
+  into a different container.
+- **Subtitles - ASS, SSA, LRC, SBV.** Join SRT and VTT with full pairwise
+  conversion between all six formats. Converting ASS/SSA to SRT shows a
+  tooltip warning that styling, karaoke, and positioning are dropped.
+- **Spreadsheets - TSV.** Round-trips with CSV and XLSX alongside the
+  existing CSV/XLSX pair.
+- **Archives - tar.bz2, tbz2, tar.xz, txz.** Join ZIP, TAR, and TGZ with
+  bzip2 and xz compressed tarballs, including their short aliases.
+- **Structured data - NDJSON, JSONL, plist.** Join JSON and YAML for
+  line-delimited JSON and Apple property list interchange.
+- **Video codec choice.** MP4/MKV output can now target H.264 or AV1.
+- **M4A audio codec choice.** M4A output can now target AAC or ALAC.
+
+Routing, hardening, and correctness fixes shipped alongside this format
+expansion are listed in `.github/RELEASE_NOTES_v2.4.0.md`.
 
 ---
 
@@ -130,20 +172,21 @@ it the same way the existing engines are wired — one module under
 
 ## What it can do
 
-| Category      | Supported extensions                                                               |
-| ------------- | ---------------------------------------------------------------------------------- |
-| Video         | mp4, mkv, webm, mov, avi, flv, wmv, m4v, mpg, mpeg, 3gp, ts, gif                   |
-| Audio         | mp3, wav, flac, ogg, m4a, aac, opus, wma, aiff                                     |
-| Images        | png, jpg, jpeg, webp, bmp, tiff, tif, ico, heic, heif                              |
-| Documents     | pdf, docx, odt, rtf, epub, md, html, htm, txt, tex                                 |
-| Subtitles     | srt, vtt                                                                           |
-| Spreadsheets  | csv, xlsx                                                                          |
-| Archives      | zip, tar, tgz                                                                      |
-| Data          | json, yaml, yml                                                                    |
+| Category      | Supported extensions                                                                                                                                                        |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Video         | mp4, mkv, webm, mov, avi, mxf, rm, swf, vob, asf, ogv, m2ts, mts, f4v (read/write); y4m, ivf (write-only); flv, wmv, m4v, mpg, mpeg, 3gp, ts, dv, gif (read-only)             |
+| Audio         | mp3, wav, flac, ogg, m4a, aac, opus, ac3, mp2, spx, caf, au, wv, voc, w64, mka, m4b, oga, aif, tta, amr, weba; wma, aiff (read-only)                                          |
+| Images        | png, jpg, jpeg, jpe, jfif, webp, bmp, tiff, tif, ico, heic, heif, avif, jp2, j2k, jpx, tga, pcx, ppm, pgm, pbm, dds, icns                                                     |
+| Documents     | pdf, docx, odt, rtf, epub, md, html, htm, txt, tex, adoc, tei, icml, pptx, rst, org, textile, typst, ipynb, fb2, opml, muse, man, native, mediawiki, wiki, dokuwiki, jira, docbook |
+| Comics        | cbz, cbt (to pdf, zip, or tar)                                                                                                                                                |
+| Subtitles     | srt, vtt, ass, ssa, lrc, sbv                                                                                                                                                  |
+| Spreadsheets  | csv, tsv, xlsx                                                                                                                                                                |
+| Archives      | zip, tar, tgz, tar.gz, tar.bz2, tbz2, tar.xz, txz                                                                                                                             |
+| Data          | json, yaml, yml, ndjson, jsonl, plist                                                                                                                                         |
 
 PDF works in **both directions**: any of the document formats above can be
 rendered into a PDF, and a PDF can be exported back out to docx, odt, rtf,
-epub, md, html, or txt. PDF → doc-family conversions extract the text via
+epub, md, html, txt, or cbz. PDF -> doc-family conversions extract the text via
 pypdf and pipe it through pandoc, so the original visual layout is dropped
 in favor of clean editable structure.
 
@@ -154,13 +197,18 @@ Features:
 - Near-lossless quality by default (CRF 17, preset slow, 320 kbps audio, 95%
   JPEG/WebP). An opt-in "Customize quality settings" checkbox exposes sliders
   if you'd rather trade quality for smaller files.
+- Video codec choice for MP4/MKV output (H.264 or AV1) and M4A audio codec
+  choice (AAC or ALAC), independent of the quality-customize toggle.
 - Hardware video encoding: a "Video encoder" choice (Automatic / CPU /
-  NVIDIA NVENC / AMD AMF) offloads H.264 conversions (MP4/MKV/MOV/FLV/M4V/
-  3GP/TS) to a supported GPU for a large speed-up. Unavailable vendors are
-  greyed out and unsupported outputs (VP9, etc.) always stay on CPU; a
-  forced-but-missing GPU falls back to CPU without failing the job.
+  NVIDIA NVENC / AMD AMF) offloads H.264 conversions to a supported GPU for
+  a large speed-up. Unavailable vendors are greyed out and unsupported
+  outputs (VP9, etc.) always stay on CPU; a forced-but-missing GPU falls
+  back to CPU without failing the job.
+- A warning tooltip on the target dropdown when converting ASS/SSA subtitles
+  to SRT, since styling, karaoke, and positioning don't survive the format
+  change.
 - Real-time progress bars parsed from FFmpeg's output.
-- Overwrite confirmation with optional auto-rename to `file (1).ext`, `file (2).ext`, …
+- Overwrite confirmation with optional auto-rename to `file (1).ext`, `file (2).ext`, ...
 - Right-click a row (or press Delete) to remove it from the queue.
 
 ---
@@ -259,7 +307,8 @@ Push a tag matching `v*` (e.g. `v1.0.0`) and
 - `build-windows` produces Setup.exe + Portable.exe on `windows-latest`.
 
 Both jobs attach their artifacts to the GitHub Release created for the tag,
-using the body from `.github/RELEASE_NOTES_v<version>.md`.
+using the body from `.github/RELEASE_NOTES_v<version>.md`. The release is
+created as a draft so it can be reviewed before publishing.
 
 ---
 
