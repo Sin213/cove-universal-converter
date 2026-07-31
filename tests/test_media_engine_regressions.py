@@ -26,6 +26,10 @@ def _ffmpeg_worker(output_suffix: str) -> FFmpegWorker:
     return worker
 
 
+def _argument_value(cmd: list[str], flag: str) -> str:
+    return cmd[cmd.index(flag) + 1]
+
+
 def test_audio_args_keep_opus_and_vorbis_within_supported_limits() -> None:
     assert _audio_encode_args("libopus", 320) == [
         "-c:a",
@@ -41,6 +45,138 @@ def test_audio_args_keep_opus_and_vorbis_within_supported_limits() -> None:
         "-b:a",
         "192k",
     ]
+    assert _audio_encode_args("alac", 320) == ["-c:a", "alac"]
+
+
+@pytest.mark.parametrize(
+    ("suffix", "codec"),
+    [
+        (".aif", "pcm_s16be"),
+        (".ac3", "ac3"),
+        (".mp2", "mp2"),
+        (".spx", "libspeex"),
+        (".caf", "pcm_s16le"),
+        (".au", "pcm_s16be"),
+        (".wv", "wavpack"),
+        (".voc", "pcm_s16le"),
+        (".w64", "pcm_s16le"),
+        (".mka", "libopus"),
+        (".m4b", "aac"),
+        (".oga", "libvorbis"),
+        (".tta", "tta"),
+        (".amr", "libopencore_amrnb"),
+        (".weba", "libopus"),
+    ],
+)
+def test_added_audio_outputs_use_verified_codecs(
+    suffix: str, codec: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ffmpeg_engine, "resolve", lambda _name: "ffmpeg")
+    cmd = _ffmpeg_worker(suffix)._build_cmd()
+
+    assert "-vn" in cmd
+    assert _argument_value(cmd, "-c:a") == codec
+
+
+def test_weba_selects_webm_muxer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ffmpeg_engine, "resolve", lambda _name: "ffmpeg")
+    cmd = _ffmpeg_worker(".weba")._build_cmd()
+
+    assert _argument_value(cmd, "-f") == "webm"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_codec"),
+    [
+        (".mp4", "libaom-av1"),
+        (".mkv", "libaom-av1"),
+        (".mov", "libx264"),
+    ],
+)
+def test_av1_setting_only_applies_to_mp4_and_mkv(
+    suffix: str,
+    expected_codec: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ffmpeg_engine, "resolve", lambda _name: "ffmpeg")
+    worker = _ffmpeg_worker(suffix)
+    worker.settings.video_codec = "av1"
+
+    assert _argument_value(worker._build_cmd(), "-c:v") == expected_codec
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_codec"),
+    [
+        (".m4a", "alac"),
+        (".m4b", "aac"),
+    ],
+)
+def test_alac_setting_only_applies_to_m4a(
+    suffix: str,
+    expected_codec: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ffmpeg_engine, "resolve", lambda _name: "ffmpeg")
+    worker = _ffmpeg_worker(suffix)
+    worker.settings.m4a_codec = "alac"
+
+    assert _argument_value(worker._build_cmd(), "-c:a") == expected_codec
+
+
+def test_amr_is_constrained_to_narrowband_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ffmpeg_engine, "resolve", lambda _name: "ffmpeg")
+    cmd = _ffmpeg_worker(".amr")._build_cmd()
+
+    assert _argument_value(cmd, "-ar") == "8000"
+    assert _argument_value(cmd, "-ac") == "1"
+    assert _argument_value(cmd, "-b:a") == "12.2k"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "video_codec", "audio_codec"),
+    [
+        (".mxf", "mpeg2video", "pcm_s16le"),
+        (".rm", "rv10", "ac3"),
+        (".swf", "flv1", "libmp3lame"),
+        (".vob", "mpeg2video", "mp2"),
+        (".asf", "msmpeg4v3", "wmav2"),
+        (".ogv", "libtheora", "libvorbis"),
+        (".m2ts", "mpeg2video", "mp2"),
+        (".mts", "mpeg2video", "mp2"),
+        (".f4v", "libx264", "aac"),
+        (".y4m", "rawvideo", None),
+        (".ivf", "libvpx-vp9", None),
+    ],
+)
+def test_added_video_outputs_use_verified_profiles(
+    suffix: str,
+    video_codec: str,
+    audio_codec: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ffmpeg_engine, "resolve", lambda _name: "ffmpeg")
+    cmd = _ffmpeg_worker(suffix)._build_cmd()
+
+    assert _argument_value(cmd, "-c:v") == video_codec
+    if audio_codec is None:
+        assert "-an" in cmd
+        assert "-c:a" not in cmd
+    else:
+        assert _argument_value(cmd, "-c:a") == audio_codec
+
+
+def test_mxf_forces_48_khz_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ffmpeg_engine, "resolve", lambda _name: "ffmpeg")
+    cmd = _ffmpeg_worker(".mxf")._build_cmd()
+
+    assert _argument_value(cmd, "-ar") == "48000"
+
+
+def test_dv_remains_input_only() -> None:
+    assert ".dv" not in ffmpeg_engine._VIDEO_CODEC
 
 
 @pytest.mark.parametrize("suffix", [".webm", ".avi"])

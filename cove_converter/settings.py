@@ -20,6 +20,16 @@ VIDEO_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast",
                  "medium", "slow", "slower", "veryslow")
 AUDIO_BITRATES = (96, 128, 160, 192, 256, 320)
 
+VIDEO_CODEC_KEYS = ("h264", "av1")
+VIDEO_CODEC_OPTIONS = ("H.264", "AV1")
+VIDEO_CODEC_KEY_MAP = dict(zip(VIDEO_CODEC_OPTIONS, VIDEO_CODEC_KEYS))
+VIDEO_CODEC_LABEL_MAP = dict(zip(VIDEO_CODEC_KEYS, VIDEO_CODEC_OPTIONS))
+
+M4A_CODEC_KEYS = ("aac", "alac")
+M4A_CODEC_OPTIONS = ("AAC", "ALAC")
+M4A_CODEC_KEY_MAP = dict(zip(M4A_CODEC_OPTIONS, M4A_CODEC_KEYS))
+M4A_CODEC_LABEL_MAP = dict(zip(M4A_CODEC_KEYS, M4A_CODEC_OPTIONS))
+
 # Video encoder preference. Independent of use_custom_quality: a hardware
 # choice always applies (like max_concurrent). Unavailable vendors fall back
 # to CPU inside the engine, so forcing one never fails a job.
@@ -55,8 +65,10 @@ class ConversionSettings:
     max_concurrent: int = 3
 
     # Hardware video encoder preference (auto/cpu/nvenc/amf). Independent of
-    # the quality toggle; always applies. Only affects H.264/H.265 outputs.
+    # the quality toggle; always applies. Only affects H.264/H.265/AV1 outputs.
     encoder_pref: str = "auto"
+    video_codec: str = "h264"
+    m4a_codec: str = "aac"
 
     # PDF-specific. Off by default — Cove apps must never auto-degrade user
     # files. Only honoured by the pdf→pdf branch in PdfWorker.
@@ -90,6 +102,8 @@ class ConversionSettings:
         qs.setValue("webp_quality", self.webp_quality)
         qs.setValue("max_concurrent", self.max_concurrent)
         qs.setValue("encoder_pref", self.encoder_pref)
+        qs.setValue("video_codec", self.video_codec)
+        qs.setValue("m4a_codec", self.m4a_codec)
         qs.endGroup()
 
 
@@ -142,6 +156,8 @@ def load_settings() -> ConversionSettings:
         webp_quality=_stored_int(qs, "webp_quality", defaults.webp_quality, 1, 100),
         max_concurrent=_stored_int(qs, "max_concurrent", defaults.max_concurrent, 1, 16),
         encoder_pref=str(qs.value("encoder_pref", defaults.encoder_pref)),
+        video_codec=str(qs.value("video_codec", defaults.video_codec)),
+        m4a_codec=str(qs.value("m4a_codec", defaults.m4a_codec)),
     )
     qs.endGroup()
     # Clamp video_preset to valid values in case stored value is stale.
@@ -150,6 +166,10 @@ def load_settings() -> ConversionSettings:
     # Fall back to auto on an unknown/hand-edited encoder preference.
     if s.encoder_pref not in ENCODER_KEYS:
         s.encoder_pref = defaults.encoder_pref
+    if s.video_codec not in VIDEO_CODEC_KEYS:
+        s.video_codec = defaults.video_codec
+    if s.m4a_codec not in M4A_CODEC_KEYS:
+        s.m4a_codec = defaults.m4a_codec
     return s
 
 

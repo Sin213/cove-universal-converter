@@ -1,8 +1,7 @@
-"""Data-format worker — converts JSON ↔ YAML.
+"""Data-format worker — converts JSON, YAML, NDJSON, and property lists.
 
-These are the two formats anyone configuring software / shipping API payloads
-deals with daily. Both encode the same structural primitives (dict, list,
-str, int, float, bool, null), so the round-trip is faithful for normal data.
+These formats cover configuration, record streams, API payloads, and Apple
+property lists. Conversions remain lossless for their shared structural subset.
 
 We use ``yaml.safe_load`` / ``yaml.safe_dump`` to avoid loading arbitrary
 Python objects from untrusted YAML.
@@ -12,6 +11,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import math
+import plistlib
 from pathlib import Path
 
 from cove_converter.engines.base import BaseConverterWorker
@@ -51,6 +51,18 @@ class JsonDuplicateKeyError(RuntimeError):
 
 class JsonNonFiniteNumberError(RuntimeError):
     """Raised when JSON contains a non-finite number."""
+
+
+class NdjsonSyntaxError(RuntimeError):
+    """Raised when one logical NDJSON record is not strict JSON."""
+
+
+class NdjsonTopLevelError(RuntimeError):
+    """Raised when a value cannot be represented as an NDJSON record stream."""
+
+
+class PlistUnsupportedValueError(RuntimeError):
+    """Raised when a value cannot be represented losslessly in JSON/plist."""
 
 
 def _json_loads_no_duplicate_keys(text: str):
@@ -148,14 +160,7 @@ def _json_safe(value):
 
 
 def _json_to_yaml(input_path: Path, output_path: Path) -> None:
-    import yaml  # type: ignore[import-untyped]
-
-    data = _json_loads_no_duplicate_keys(_read_text(input_path))
-    with output_path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(
-            data, f,
-            sort_keys=False, allow_unicode=True, default_flow_style=False,
-        )
+    _write_data(_load_data(input_path, ".json"), output_path, ".yaml")
 
 
 def _build_collision_loader():
@@ -240,16 +245,146 @@ def _build_collision_loader():
 
 
 def _yaml_to_json(input_path: Path, output_path: Path) -> None:
+    _write_data(_load_data(input_path, ".yaml"), output_path, ".json")
+
+
+def _load_yaml(input_path: Path):
     loader_cls = _build_collision_loader()
     loader = loader_cls(_read_text(input_path))
     try:
-        data = _json_safe(loader.get_single_data())
+        return _json_safe(loader.get_single_data())
     finally:
         loader.dispose()
-    output_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
+
+
+def _load_ndjson(input_path: Path) -> list[object]:
+    records: list[object] = []
+    for line_number, line in enumerate(_read_text(input_path).splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(_json_loads_no_duplicate_keys(line))
+        except (
+            json.JSONDecodeError,
+            JsonDuplicateKeyError,
+            JsonNonFiniteNumberError,
+        ) as exc:
+            raise NdjsonSyntaxError(
+                f"Invalid NDJSON record on line {line_number}: {exc}"
+            ) from exc
+    return records
+
+
+def _plist_json_safe(value, *, path: str = "$"):
+    if isinstance(value, dict):
+        out: dict[str, object] = {}
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise PlistUnsupportedValueError(
+                    f"Property-list key at {path} is not a string: {key!r}"
+                )
+            out[key] = _plist_json_safe(child, path=f"{path}.{key}")
+        return out
+    if isinstance(value, (list, tuple)):
+        return [
+            _plist_json_safe(child, path=f"{path}[{index}]")
+            for index, child in enumerate(value)
+        ]
+    if value is None or isinstance(
+        value,
+        (
+            bytes,
+            bytearray,
+            _dt.datetime,
+            plistlib.UID,
+        ),
+    ):
+        raise PlistUnsupportedValueError(
+            f"Value at {path} ({type(value).__name__}) cannot be converted "
+            "losslessly between JSON and property-list formats"
+        )
+    if isinstance(value, float) and not math.isfinite(value):
+        raise PlistUnsupportedValueError(
+            f"Non-finite number at {path} cannot be represented safely"
+        )
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    raise PlistUnsupportedValueError(
+        f"Value at {path} has unsupported type {type(value).__name__}"
     )
+
+
+def _load_data(input_path: Path, ext: str):
+    if ext == ".json":
+        return _json_loads_no_duplicate_keys(_read_text(input_path))
+    if ext in (".yaml", ".yml"):
+        return _load_yaml(input_path)
+    if ext in (".ndjson", ".jsonl"):
+        return _load_ndjson(input_path)
+    if ext == ".plist":
+        return _plist_json_safe(plistlib.loads(input_path.read_bytes()))
+    raise RuntimeError(f"Unsupported data input format {ext}")
+
+
+def _write_data(data, output_path: Path, ext: str) -> None:
+    if ext == ".json":
+        output_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        return
+    if ext in (".yaml", ".yml"):
+        import yaml  # type: ignore[import-untyped]
+
+        with output_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                data,
+                f,
+                sort_keys=False,
+                allow_unicode=True,
+                default_flow_style=False,
+            )
+        return
+    if ext in (".ndjson", ".jsonl"):
+        if not isinstance(data, list):
+            raise NdjsonTopLevelError(
+                "NDJSON output requires a top-level array of records"
+            )
+        lines = [
+            json.dumps(
+                record,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            for record in data
+        ]
+        output_path.write_text(
+            "\n".join(lines) + ("\n" if lines else ""),
+            encoding="utf-8",
+        )
+        return
+    if ext == ".plist":
+        safe_data = _plist_json_safe(data)
+        try:
+            output_path.write_bytes(
+                plistlib.dumps(
+                    safe_data,
+                    fmt=plistlib.FMT_XML,
+                    sort_keys=False,
+                )
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise PlistUnsupportedValueError(
+                f"Value cannot be represented as a property list: {exc}"
+            ) from exc
+        return
+    raise RuntimeError(f"Unsupported data output format {ext}")
+
+
+_DATA_EXTENSIONS = frozenset(
+    (".json", ".yaml", ".yml", ".ndjson", ".jsonl", ".plist")
+)
 
 
 class DataWorker(BaseConverterWorker):
@@ -258,13 +393,15 @@ class DataWorker(BaseConverterWorker):
         out_ext = self.output_path.suffix.lower()
         self.progress.emit(20)
 
-        if in_ext == ".json" and out_ext in (".yaml", ".yml"):
-            _json_to_yaml(self.input_path, self.output_path)
-        elif in_ext in (".yaml", ".yml") and out_ext == ".json":
-            _yaml_to_json(self.input_path, self.output_path)
-        elif in_ext in (".yaml", ".yml") and out_ext in (".yaml", ".yml"):
+        if in_ext in (".yaml", ".yml") and out_ext in (".yaml", ".yml"):
             # Reformatting between .yaml and .yml is a no-op other than ext.
             self.output_path.write_text(_read_text(self.input_path), encoding="utf-8")
+        elif in_ext in _DATA_EXTENSIONS and out_ext in _DATA_EXTENSIONS:
+            _write_data(
+                _load_data(self.input_path, in_ext),
+                self.output_path,
+                out_ext,
+            )
         else:
             raise RuntimeError(f"DataWorker cannot convert {in_ext} → {out_ext}")
 

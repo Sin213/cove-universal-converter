@@ -1,4 +1,4 @@
-"""Spreadsheet worker — converts CSV ↔ XLSX.
+"""Spreadsheet worker — converts CSV, TSV, and XLSX.
 
 These two cover the bulk of real-world spreadsheet handoffs: CSV from data
 exports / databases / APIs, XLSX from Excel / Google Sheets / LibreOffice.
@@ -58,7 +58,12 @@ def _read_csv_text(path: Path) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _csv_to_xlsx(input_path: Path, output_path: Path) -> None:
+def _csv_to_xlsx(
+    input_path: Path,
+    output_path: Path,
+    *,
+    delimiter: str = ",",
+) -> None:
     from openpyxl import Workbook  # type: ignore[import-untyped]
 
     wb = Workbook()
@@ -83,7 +88,7 @@ def _csv_to_xlsx(input_path: Path, output_path: Path) -> None:
                     except OverflowError:
                         limit //= 2
                 with io.StringIO(_read_csv_text(input_path), newline="") as f:
-                    reader = csv.reader(f)
+                    reader = csv.reader(f, delimiter=delimiter)
                     for row_idx, row in enumerate(reader, start=1):
                         for col_idx, value in enumerate(row, start=1):
                             cell = ws.cell(
@@ -119,7 +124,12 @@ def _csv_escape_formula(value):
     return value
 
 
-def _xlsx_to_csv(input_path: Path, output_path: Path) -> None:
+def _xlsx_to_csv(
+    input_path: Path,
+    output_path: Path,
+    *,
+    delimiter: str = ",",
+) -> None:
     from openpyxl import load_workbook  # type: ignore[import-untyped]
 
     # ``data_only=True`` returns cached formula results; cells whose formulas
@@ -135,7 +145,7 @@ def _xlsx_to_csv(input_path: Path, output_path: Path) -> None:
         # utf-8-sig: without a BOM, Excel assumes the ANSI codepage and shows
         # mojibake for non-ASCII cells. The read direction accepts BOMs too.
         with output_path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
+            writer = csv.writer(f, delimiter=delimiter)
             for value_row, formula_row in zip(
                 ws_values.iter_rows(values_only=True),
                 ws_formulas.iter_rows(values_only=True),
@@ -163,16 +173,59 @@ def _xlsx_to_csv(input_path: Path, output_path: Path) -> None:
         wb_formulas.close()
 
 
+def _delimited_to_delimited(
+    input_path: Path,
+    output_path: Path,
+    *,
+    input_delimiter: str,
+    output_delimiter: str,
+) -> None:
+    with _CSV_FIELD_SIZE_LOCK:
+        previous_limit = csv.field_size_limit()
+        try:
+            limit = sys.maxsize
+            while True:
+                try:
+                    csv.field_size_limit(limit)
+                    break
+                except OverflowError:
+                    limit //= 2
+            with io.StringIO(_read_csv_text(input_path), newline="") as source:
+                reader = csv.reader(source, delimiter=input_delimiter)
+                with output_path.open("w", encoding="utf-8-sig", newline="") as output:
+                    writer = csv.writer(output, delimiter=output_delimiter)
+                    writer.writerows(
+                        [_csv_escape_formula(value) for value in row] for row in reader
+                    )
+        finally:
+            csv.field_size_limit(previous_limit)
+
+
 class SpreadsheetWorker(BaseConverterWorker):
     def _convert(self) -> None:
         in_ext = self.input_path.suffix.lower()
         out_ext = self.output_path.suffix.lower()
         self.progress.emit(15)
 
-        if in_ext == ".csv" and out_ext == ".xlsx":
-            _csv_to_xlsx(self.input_path, self.output_path)
-        elif in_ext == ".xlsx" and out_ext == ".csv":
-            _xlsx_to_csv(self.input_path, self.output_path)
+        if in_ext in (".csv", ".tsv") and out_ext == ".xlsx":
+            _csv_to_xlsx(
+                self.input_path,
+                self.output_path,
+                delimiter="\t" if in_ext == ".tsv" else ",",
+            )
+        elif in_ext == ".xlsx" and out_ext in (".csv", ".tsv"):
+            _xlsx_to_csv(
+                self.input_path,
+                self.output_path,
+                delimiter="\t" if out_ext == ".tsv" else ",",
+            )
+        elif in_ext in (".csv", ".tsv") and out_ext in (".csv", ".tsv"):
+            _delimited_to_delimited(
+                self.input_path,
+                self.output_path,
+                input_delimiter="\t" if in_ext == ".tsv" else ",",
+                output_delimiter="\t" if out_ext == ".tsv" else ",",
+            )
         else:
             raise RuntimeError(
                 f"SpreadsheetWorker cannot convert {in_ext} → {out_ext}",

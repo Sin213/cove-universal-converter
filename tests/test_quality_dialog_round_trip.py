@@ -21,6 +21,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from cove_converter.settings import (  # noqa: E402
     AUDIO_BITRATES,
+    M4A_CODEC_KEYS,
+    VIDEO_CODEC_KEYS,
     VIDEO_PRESETS,
     ConversionSettings,
 )
@@ -62,6 +64,18 @@ class QualityDialogRoundTrip(unittest.TestCase):
                 self.assertEqual(
                     self._round_trip(settings).audio_bitrate_kbps, kbps,
                 )
+
+    def test_every_supported_video_codec_round_trips(self) -> None:
+        for codec in VIDEO_CODEC_KEYS:
+            with self.subTest(codec=codec):
+                settings = ConversionSettings(video_codec=codec)
+                self.assertEqual(self._round_trip(settings).video_codec, codec)
+
+    def test_every_supported_m4a_codec_round_trips(self) -> None:
+        for codec in M4A_CODEC_KEYS:
+            with self.subTest(codec=codec):
+                settings = ConversionSettings(m4a_codec=codec)
+                self.assertEqual(self._round_trip(settings).m4a_codec, codec)
 
     def test_audio_96_and_160_round_trip(self) -> None:
         # Specifically called out in the review — guarded against regression.

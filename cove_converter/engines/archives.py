@@ -1,4 +1,4 @@
-"""Archive worker — converts between ZIP, TAR, and TAR.GZ (.tgz).
+"""Archive worker — converts between ZIP and TAR-family containers.
 
 ZIP is the dominant cross-platform archive; TAR is the Unix native; TGZ
 (gzipped tar) is the standard Linux distribution format. Conversion is
@@ -36,25 +36,61 @@ class ArchiveTooLargeError(RuntimeError):
     bounded-extraction limits defined above."""
 
 
+_COMPOUND_ARCHIVE_SUFFIXES = (".tar.bz2", ".tar.xz", ".tar.gz")
+
+
+def _archive_ext(path: Path) -> str:
+    name = path.name.lower()
+    for suffix in _COMPOUND_ARCHIVE_SUFFIXES:
+        if name.endswith(suffix):
+            return suffix
+    return path.suffix.lower()
+
+
+def _is_zip_like(ext: str) -> bool:
+    return ext in (".zip", ".cbz")
+
+
 def _is_tar_like(ext: str) -> bool:
-    return ext in (".tar", ".tgz", ".gz")
+    return ext in (
+        ".tar",
+        ".cbt",
+        ".tgz",
+        ".gz",
+        ".tar.gz",
+        ".tar.bz2",
+        ".tbz2",
+        ".tar.xz",
+        ".txz",
+    )
 
 
 @overload
-def _tar_mode(out_ext: str, *, write: Literal[False]) -> Literal["r", "r:gz"]: ...
+def _tar_mode(
+    out_ext: str, *, write: Literal[False]
+) -> Literal["r", "r:gz", "r:bz2", "r:xz"]: ...
 
 
 @overload
-def _tar_mode(out_ext: str, *, write: Literal[True]) -> Literal["w", "w:gz"]: ...
+def _tar_mode(
+    out_ext: str, *, write: Literal[True]
+) -> Literal["w", "w:gz", "w:bz2", "w:xz"]: ...
 
 
 def _tar_mode(
     out_ext: str, *, write: bool
-) -> Literal["r", "r:gz", "w", "w:gz"]:
-    compressed = out_ext in (".tgz", ".gz")
+) -> Literal["r", "r:gz", "r:bz2", "r:xz", "w", "w:gz", "w:bz2", "w:xz"]:
+    if out_ext in (".tgz", ".gz", ".tar.gz"):
+        compression = "gz"
+    elif out_ext in (".tar.bz2", ".tbz2"):
+        compression = "bz2"
+    elif out_ext in (".tar.xz", ".txz"):
+        compression = "xz"
+    else:
+        compression = ""
     if write:
-        return "w:gz" if compressed else "w"
-    return "r:gz" if compressed else "r"
+        return f"w:{compression}" if compression else "w"
+    return f"r:{compression}" if compression else "r"
 
 
 # Extraction hits the local filesystem, so duplicate detection must model
@@ -270,8 +306,8 @@ def _safe_tar_extract(tf: tarfile.TarFile, dst: Path) -> None:
 
 
 def _extract_to(src: Path, dst: Path) -> None:
-    ext = src.suffix.lower()
-    if ext == ".zip":
+    ext = _archive_ext(src)
+    if _is_zip_like(ext):
         with zipfile.ZipFile(src, "r") as zf:
             _safe_zip_extract(zf, dst)
     elif _is_tar_like(ext):
@@ -281,7 +317,9 @@ def _extract_to(src: Path, dst: Path) -> None:
         raise RuntimeError(f"Unsupported archive input: {ext}")
 
 
-def _pack_from(src: Path, dst: Path) -> None:
+def _pack_from(
+    src: Path, dst: Path, *, archive_ext: str | None = None
+) -> None:
     # Reuse the extraction caps as the repack output cap: even though we
     # already bounded what could land in ``src``, a stray FS symlink or a
     # logic bug here mustn't be able to fabricate an oversized output.
@@ -289,7 +327,7 @@ def _pack_from(src: Path, dst: Path) -> None:
     # ``is_symlink()`` *first* and skip those entries entirely — that
     # closes the bypass where one in-tree symlink could be packed many
     # times into the output ZIP/TAR.
-    ext = dst.suffix.lower()
+    ext = archive_ext or _archive_ext(dst)
     member_count = 0
     written_total = 0
 
@@ -315,7 +353,7 @@ def _pack_from(src: Path, dst: Path) -> None:
                 f"exceeds total limit {MAX_EXTRACTED_BYTES}"
             )
 
-    if ext == ".zip":
+    if _is_zip_like(ext):
         # ``strict_timestamps=False`` makes Python clamp file mtimes outside
         # the ZIP-supported range (1980-01-01 .. 2107-12-31) to the boundary
         # rather than raising. TAR/TGZ archives legally carry pre-1980 mtimes
@@ -367,11 +405,15 @@ def _pack_from(src: Path, dst: Path) -> None:
 
 class ArchiveWorker(BaseConverterWorker):
     def _convert(self) -> None:
-        in_ext = self.input_path.suffix.lower()
-        out_ext = self.output_path.suffix.lower()
-        if in_ext not in (".zip", ".tar", ".tgz", ".gz"):
+        in_ext = _archive_ext(self.input_path)
+        # ``BaseConverterWorker.run`` replaces ``output_path`` with an atomic
+        # temp path that preserves only the last suffix. Read the requested
+        # final path so compound forms such as ``.tar.bz2`` retain their mode.
+        final_output_path = getattr(self, "_final_output_path", self.output_path)
+        out_ext = _archive_ext(final_output_path)
+        if not (_is_zip_like(in_ext) or _is_tar_like(in_ext)):
             raise RuntimeError(f"ArchiveWorker cannot read {in_ext}")
-        if out_ext not in (".zip", ".tar", ".tgz", ".gz"):
+        if not (_is_zip_like(out_ext) or _is_tar_like(out_ext)):
             raise RuntimeError(f"ArchiveWorker cannot write {out_ext}")
 
         self.progress.emit(10)
@@ -380,7 +422,7 @@ class ArchiveWorker(BaseConverterWorker):
             tmp_path = Path(tmp)
             _extract_to(self.input_path, tmp_path)
             self.progress.emit(55)
-            _pack_from(tmp_path, self.output_path)
+            _pack_from(tmp_path, self.output_path, archive_ext=out_ext)
 
         self.progress.emit(90)
 

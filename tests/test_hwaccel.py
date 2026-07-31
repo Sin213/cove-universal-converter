@@ -16,7 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from cove_converter.engines import hwaccel  # noqa: E402
+from cove_converter.engines import ffmpeg as ffmpeg_engine, hwaccel  # noqa: E402
 from cove_converter.engines.ffmpeg import FFmpegWorker  # noqa: E402
 from cove_converter.settings import (  # noqa: E402
     ConversionSettings,
@@ -140,6 +140,43 @@ class BuildCmdArgMatrix(unittest.TestCase):
         self.assertNotIn("h264_nvenc", cmd)
         self.assertNotIn("h264_amf", cmd)
 
+    def test_av1_nvenc_equivalence_for_mp4_and_mkv(self) -> None:
+        for suffix in (".mp4", ".mkv"):
+            with self.subTest(suffix=suffix):
+                s = default_settings()
+                s.encoder_pref = "nvenc"
+                with mock.patch.dict(
+                    ffmpeg_engine._VIDEO_CODEC, {suffix: "libaom-av1"}
+                ):
+                    cmd = _build(suffix, s)
+                self.assertIn("av1_nvenc", cmd)
+                self.assertNotIn("libaom-av1", cmd)
+
+    def test_av1_amf_equivalence_for_mp4_and_mkv(self) -> None:
+        for suffix in (".mp4", ".mkv"):
+            with self.subTest(suffix=suffix):
+                s = default_settings()
+                s.encoder_pref = "amf"
+                with mock.patch.dict(
+                    ffmpeg_engine._VIDEO_CODEC, {suffix: "libaom-av1"}
+                ):
+                    cmd = _build(suffix, s)
+                self.assertIn("av1_amf", cmd)
+                self.assertNotIn("libaom-av1", cmd)
+
+    def test_av1_cpu_equivalence_for_mp4_and_mkv(self) -> None:
+        for suffix in (".mp4", ".mkv"):
+            with self.subTest(suffix=suffix):
+                s = default_settings()
+                s.encoder_pref = "cpu"
+                with mock.patch.dict(
+                    ffmpeg_engine._VIDEO_CODEC, {suffix: "libaom-av1"}
+                ):
+                    cmd = _build(suffix, s)
+                self.assertIn("libaom-av1", cmd)
+                self.assertIn("-crf", cmd)
+                self.assertEqual(cmd[cmd.index("-b:v") + 1], "0")
+
 
 class BuildCmdNoGpu(unittest.TestCase):
     """With every probe False, GPU prefs still emit valid CPU commands."""
@@ -261,6 +298,24 @@ class SettingsRoundTrip(unittest.TestCase):
         self._qs.setValue("encoder_pref", "bogus")
         self._qs.endGroup()
         self.assertEqual(load_settings().encoder_pref, "auto")
+
+    def test_codec_choices_survive_save_load(self) -> None:
+        s = default_settings()
+        s.video_codec = "av1"
+        s.m4a_codec = "alac"
+        s.save()
+        loaded = load_settings()
+        self.assertEqual(loaded.video_codec, "av1")
+        self.assertEqual(loaded.m4a_codec, "alac")
+
+    def test_unknown_codec_choices_fall_back_to_defaults(self) -> None:
+        self._qs.beginGroup("quality")
+        self._qs.setValue("video_codec", "bogus")
+        self._qs.setValue("m4a_codec", "bogus")
+        self._qs.endGroup()
+        loaded = load_settings()
+        self.assertEqual(loaded.video_codec, "h264")
+        self.assertEqual(loaded.m4a_codec, "aac")
 
     def test_string_false_is_loaded_as_false(self) -> None:
         self._qs.beginGroup("quality")

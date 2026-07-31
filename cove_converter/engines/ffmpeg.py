@@ -12,7 +12,10 @@ _TIME_RE     = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
 
 _AUDIO_ONLY_EXTS = {
     ".mp3", ".wav", ".flac", ".ogg", ".m4a",
-    ".aac", ".opus", ".wma", ".aiff",
+    ".aac", ".opus", ".wma", ".aiff", ".aif",
+    ".ac3", ".mp2", ".spx", ".caf", ".au",
+    ".wv", ".voc", ".w64", ".mka", ".m4b",
+    ".oga", ".tta", ".amr", ".weba",
 }
 
 _AUDIO_CODEC: dict[str, str] = {
@@ -25,6 +28,26 @@ _AUDIO_CODEC: dict[str, str] = {
     ".opus": "libopus",
     ".wma":  "wmav2",
     ".aiff": "pcm_s16be",
+    ".aif":  "pcm_s16be",
+    ".ac3":  "ac3",
+    ".mp2":  "mp2",
+    ".spx":  "libspeex",
+    ".caf":  "pcm_s16le",
+    ".au":   "pcm_s16be",
+    ".wv":   "wavpack",
+    ".voc":  "pcm_s16le",
+    ".w64":  "pcm_s16le",
+    ".mka":  "libopus",
+    ".m4b":  "aac",
+    ".oga":  "libvorbis",
+    ".tta":  "tta",
+    ".amr":  "libopencore_amrnb",
+    ".weba": "libopus",
+}
+
+_AUDIO_MUXER: dict[str, str] = {
+    # ffmpeg does not infer the WebM muxer from the de-facto .weba suffix.
+    ".weba": "webm",
 }
 
 _VIDEO_CODEC: dict[str, str] = {
@@ -40,22 +63,46 @@ _VIDEO_CODEC: dict[str, str] = {
     ".mpeg": "mpeg2video",
     ".3gp":  "libx264",
     ".ts":   "libx264",
+    ".mxf":  "mpeg2video",
+    ".rm":   "rv10",
+    ".swf":  "flv1",
+    ".vob":  "mpeg2video",
+    ".asf":  "msmpeg4v3",
+    ".ogv":  "libtheora",
+    ".m2ts": "mpeg2video",
+    ".mts":  "mpeg2video",
+    ".f4v":  "libx264",
+    ".y4m":  "rawvideo",
+    ".ivf":  "libvpx-vp9",
 }
 
-# Software H.264/H.265 encoders and their (NVENC, AMF) hardware equivalents.
-# Only these two have a GPU path; VP9/mpeg4/wmv2/mpeg2video stay CPU-only.
+_VIDEO_AUDIO_CODEC: dict[str, str] = {
+    ".webm": "libopus",
+    ".mxf":  "pcm_s16le",
+    ".rm":   "ac3",
+    ".swf":  "libmp3lame",
+    ".vob":  "mp2",
+    ".asf":  "wmav2",
+    ".ogv":  "libvorbis",
+    ".m2ts": "mp2",
+    ".mts":  "mp2",
+}
+
+_VIDEO_ONLY_EXTS = {".y4m", ".ivf"}
+
+# Software H.264/H.265/AV1 encoders and their (NVENC, AMF) equivalents.
 _HW_EQUIV: dict[str, tuple[str, str]] = {
     "libx264": ("h264_nvenc", "h264_amf"),
     "libx265": ("hevc_nvenc", "hevc_amf"),
+    "libaom-av1": ("av1_nvenc", "av1_amf"),
 }
 
-# Hardware encoders reachable from an actual output format. Today every
-# hardware-capable output routes to libx264, so this resolves to the H.264
-# encoders only; if an libx265 output is ever added, its HEVC encoders join
-# automatically. Detection (warm_cache / UI readiness) targets exactly this
-# set so availability reflects what _build_cmd can really select — not an
-# unused HEVC encoder.
-_HW_OUTPUT_CODECS = {c for c in _VIDEO_CODEC.values() if c in _HW_EQUIV}
+# Hardware encoders reachable from static mappings or selectable codec paths.
+_HW_OUTPUT_CODECS = {
+    codec
+    for codec in (*_VIDEO_CODEC.values(), "libaom-av1")
+    if codec in _HW_EQUIV
+}
 NVENC_ENCODERS: tuple[str, ...] = tuple(
     sorted({_HW_EQUIV[c][0] for c in _HW_OUTPUT_CODECS}))
 AMF_ENCODERS: tuple[str, ...] = tuple(
@@ -87,7 +134,7 @@ def hw_encode_args(encoder: str, crf: int) -> list[str]:
     return ["-c:v", encoder]
 
 
-_LOSSLESS_AUDIO = {"pcm_s16le", "pcm_s16be", "flac"}
+_LOSSLESS_AUDIO = {"pcm_s16le", "pcm_s16be", "flac", "wavpack", "tta", "alac"}
 
 
 def _audio_encode_args(codec: str, bitrate_kbps: int) -> list[str]:
@@ -95,6 +142,9 @@ def _audio_encode_args(codec: str, bitrate_kbps: int) -> list[str]:
     if codec in _LOSSLESS_AUDIO:
         return args
 
+    if codec == "libopencore_amrnb":
+        # AMR-NB is fixed to 8 kHz mono and accepts only a small set of bitrates.
+        return [*args, "-ar", "8000", "-ac", "1", "-b:a", "12.2k"]
     if codec == "libopus":
         bitrate_kbps = min(bitrate_kbps, 256)
     elif codec == "libvorbis":
@@ -102,6 +152,9 @@ def _audio_encode_args(codec: str, bitrate_kbps: int) -> list[str]:
         # AMR-NB, and libvorbis rejects very high rates for mono input.
         args += ["-ar", "44100"]
         bitrate_kbps = min(bitrate_kbps, 192)
+    elif codec == "libspeex":
+        args += ["-ar", "32000"]
+        bitrate_kbps = min(bitrate_kbps, 44)
 
     return [*args, "-b:a", f"{bitrate_kbps}k"]
 
@@ -152,18 +205,27 @@ class FFmpegWorker(BaseConverterWorker):
 
         if out_ext in _AUDIO_ONLY_EXTS:
             codec = _AUDIO_CODEC.get(out_ext, "aac")
+            if out_ext == ".m4a" and getattr(s, "m4a_codec", "aac") == "alac":
+                codec = "alac"
             cmd += ["-vn", *_audio_encode_args(codec, abr)]
+            muxer = _AUDIO_MUXER.get(out_ext)
+            if muxer:
+                cmd += ["-f", muxer]
             cmd += [str(self.output_path)]
             return cmd
 
         # Video output — pair a sensible audio codec with the container.
         vcodec = _VIDEO_CODEC.get(out_ext, "libx264")
-        acodec = "libopus" if out_ext == ".webm" else "aac"
+        if (
+            out_ext in {".mp4", ".mkv"}
+            and getattr(s, "video_codec", "h264") == "av1"
+        ):
+            vcodec = "libaom-av1"
+        acodec = _VIDEO_AUDIO_CODEC.get(out_ext, "aac")
         preset = s.effective_video_preset()
 
-        # Offload H.264/H.265 to a GPU encoder when the user's preference
-        # allows it and a live probe confirms it works. Anything else (VP9,
-        # mpeg4, wmv2, mpeg2video) has no hardware path and stays on CPU.
+        # Offload a mapped codec when the user's preference allows it and a
+        # live probe confirms it works. Unmapped codecs stay on CPU.
         nv, amf = _HW_EQUIV.get(vcodec, ("", ""))
         pref = s.encoder_pref
         use_nvenc = bool(
@@ -192,16 +254,26 @@ class FFmpegWorker(BaseConverterWorker):
                 # Default path: keep encode time sane and avoid the
                 # near-lossless "best" deadline that bloats output.
                 cmd += ["-deadline", "good", "-cpu-used", _WEBM_DEFAULT_CPU_USED]
+        elif vcodec == "libaom-av1":
+            cmd += ["-c:v", vcodec, "-crf", str(crf), "-b:v", "0",
+                    *_EVEN_SCALE_ARGS]
+        elif vcodec == "rawvideo":
+            cmd += ["-c:v", vcodec, *_EVEN_SCALE_ARGS]
         else:
             # qscale encoders (mpeg4, wmv2, mpeg2video) ignore -crf; without
             # a quality flag they fall back to an uncontrolled default
             # bitrate. Map the CRF setting (0-51) onto qscale 2-31.
             qv = max(2, min(31, round(s.effective_video_crf() / 3)))
             cmd += ["-c:v", vcodec, "-q:v", str(qv), *_EVEN_SCALE_ARGS]
-        if acodec == "libopus" and not s.use_custom_quality:
-            cmd += _audio_encode_args("libopus", _WEBM_DEFAULT_OPUS_KBPS)
+        if out_ext in _VIDEO_ONLY_EXTS:
+            cmd += ["-an"]
+        elif acodec == "libopus" and not s.use_custom_quality:
+            cmd += _audio_encode_args(acodec, _WEBM_DEFAULT_OPUS_KBPS)
         else:
             cmd += _audio_encode_args(acodec, abr)
+        if out_ext == ".mxf":
+            # MXF requires 48 kHz audio; ffmpeg rejects the common 44.1 kHz input.
+            cmd += ["-ar", "48000"]
         cmd += [str(self.output_path)]
         return cmd
 

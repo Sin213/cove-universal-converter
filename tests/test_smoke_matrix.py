@@ -5,6 +5,7 @@ that every advertised category contributes at least one route. Actual
 conversion correctness is exercised by ``scripts/smoke_conversions.py``,
 which does shell out to ffmpeg/pandoc and is too heavy for the unit-test
 suite."""
+
 from __future__ import annotations
 
 import os
@@ -28,19 +29,33 @@ class MatrixBuilder(unittest.TestCase):
 
     def test_every_route_has_engine(self) -> None:
         for r in self.matrix:
-            self.assertIn(r.engine, smoke.WORKER_REGISTRY,
-                          f"route {r} routed to unknown engine {r.engine!r}")
+            self.assertIn(
+                r.engine,
+                smoke.WORKER_REGISTRY,
+                f"route {r} routed to unknown engine {r.engine!r}",
+            )
 
     def test_every_route_input_is_supported(self) -> None:
         for r in self.matrix:
-            self.assertIn(r.in_ext, routing.SUPPORTED_FORMATS,
-                          f"route {r} uses unsupported input {r.in_ext}")
+            self.assertIn(
+                r.in_ext,
+                routing.SUPPORTED_FORMATS,
+                f"route {r} uses unsupported input {r.in_ext}",
+            )
 
     def test_every_advertised_engine_appears(self) -> None:
         engines = {r.engine for r in self.matrix}
         # All engines except possibly experimental ones must contribute.
-        for required in ("Pillow", "FFmpeg", "Pandoc", "Pdf",
-                         "Subtitle", "Spreadsheet", "Archive", "Data"):
+        for required in (
+            "Pillow",
+            "FFmpeg",
+            "Pandoc",
+            "Pdf",
+            "Subtitle",
+            "Spreadsheet",
+            "Archive",
+            "Data",
+        ):
             self.assertIn(required, engines, f"engine missing from matrix: {required}")
 
     def test_pdf_pair_present(self) -> None:
@@ -50,10 +65,19 @@ class MatrixBuilder(unittest.TestCase):
         self.assertIn((".txt", ".pdf"), pairs)
         self.assertIn((".pdf", ".txt"), pairs)
 
-    def test_compound_targz_present(self) -> None:
+    def test_compressed_tar_aliases_present(self) -> None:
         pairs = {(r.in_ext, r.out_ext) for r in self.matrix}
-        self.assertIn((".tar.gz", ".zip"), pairs)
-        self.assertIn((".zip", ".tgz"), pairs)
+        for extension in (
+            ".tgz",
+            ".tar.gz",
+            ".tbz2",
+            ".tar.bz2",
+            ".txz",
+            ".tar.xz",
+        ):
+            with self.subTest(extension=extension):
+                self.assertIn((extension, ".zip"), pairs)
+                self.assertIn((".zip", extension), pairs)
 
 
 class SampleGenerators(unittest.TestCase):
@@ -67,6 +91,12 @@ class SampleGenerators(unittest.TestCase):
             if in_ext not in smoke.SAMPLE_GENERATORS:
                 unknown.append(in_ext)
         self.assertFalse(unknown, f"missing sample generators for: {unknown}")
+
+    def test_every_output_has_validator(self) -> None:
+        unknown = sorted(
+            {route.out_ext for route in smoke.build_matrix()} - smoke.VALIDATORS.keys()
+        )
+        self.assertFalse(unknown, f"missing output validators for: {unknown}")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from cove_converter.binaries import PANDOC, resolve
+from cove_converter.engines.archives import _extract_to
 from cove_converter.engines.base import BaseConverterWorker
 from cove_converter.engines.pdf_flatten import flatten_pdf, has_pdf_javascript
 
@@ -45,7 +46,41 @@ _PANDOC_TIMEOUT_S       = 600
 
 
 # ---- Image → PDF -----------------------------------------------------------
-_IMAGE_TO_PDF_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+_IMAGE_TO_PDF_EXTS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".jpe",
+    ".jfif",
+    ".webp",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".ico",
+    ".heic",
+    ".heif",
+    ".avif",
+    ".jp2",
+    ".j2k",
+    ".jpx",
+    ".tga",
+    ".pcx",
+    ".ppm",
+    ".pgm",
+    ".pbm",
+    ".dds",
+    ".icns",
+}
+_COMIC_TO_PDF_EXTS = {".cbz", ".cbt"}
+
+
+def _register_optional_image_openers() -> None:
+    try:
+        import pillow_heif
+
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
 
 
 def _build_whiten_lut() -> list[int]:
@@ -194,6 +229,105 @@ def _enhance_scanned_pdf(
         progress(95)
 
 
+def _prepare_pdf_image(raw):
+    """Return a detached RGB image with transparency flattened onto white."""
+    from PIL import Image, ImageOps
+
+    img = ImageOps.exif_transpose(raw)
+    try:
+        has_transparency = (
+            img.mode in ("RGBA", "LA")
+            or "transparency" in img.info
+        )
+        if not has_transparency:
+            return img.convert("RGB")
+
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        try:
+            with img.convert("RGBA") as rgba:
+                with rgba.getchannel("A") as alpha:
+                    background.paste(rgba, mask=alpha)
+        except Exception:
+            background.close()
+            raise
+        return background
+    finally:
+        if img is not raw:
+            img.close()
+
+
+def _natural_image_key(path: Path, root: Path) -> tuple[tuple[int, int | str], ...]:
+    relative = path.relative_to(root).as_posix().casefold()
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part)
+        for part in re.split(r"(\d+)", relative)
+    )
+
+
+def _comic_to_pdf(
+    src: Path,
+    dst: Path,
+    *,
+    progress: Callable[[int], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> None:
+    """Render recursively discovered comic pages as an incrementally written PDF."""
+    from PIL import Image
+
+    if cancelled and cancelled():
+        return
+    if progress:
+        progress(5)
+
+    with tempfile.TemporaryDirectory(prefix="cove-comic-pdf-") as tmp:
+        extracted = Path(tmp)
+        _extract_to(src, extracted)
+
+        if cancelled and cancelled():
+            return
+        if progress:
+            progress(15)
+
+        pages = sorted(
+            (
+                path
+                for path in extracted.rglob("*")
+                if path.is_file() and path.suffix.lower() in _IMAGE_TO_PDF_EXTS
+            ),
+            key=lambda path: _natural_image_key(path, extracted),
+        )
+        if not pages:
+            raise RuntimeError(
+                f"Comic archive contains no supported images: {src.name}"
+            )
+
+        _register_optional_image_openers()
+        wrote_any = False
+        total = len(pages)
+        for index, page_path in enumerate(pages, start=1):
+            if cancelled and cancelled():
+                return
+
+            with Image.open(page_path) as raw:
+                page = _prepare_pdf_image(raw)
+            try:
+                page.save(
+                    str(dst),
+                    "PDF",
+                    resolution=72.0,
+                    append=wrote_any,
+                )
+            finally:
+                page.close()
+
+            wrote_any = True
+            if progress:
+                progress(15 + int(75 * index / total))
+
+    if progress:
+        progress(95)
+
+
 def _image_to_pdf(
     src: Path,
     dst: Path,
@@ -201,51 +335,33 @@ def _image_to_pdf(
     progress: Callable[[int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
-    """Render a single raster image as a one-page PDF at ``dst``.
+    """Render every raster frame as a PDF page at ``dst``."""
+    from PIL import Image
 
-    Uses PIL's native PDF writer with ``resolution=72.0`` so the page size
-    in points equals the image size in pixels (auto page size from image).
-    Transparency is flattened onto white before save to match the JPEG
-    idiom in ``cove_converter/engines/pillow.py``.
-    """
-    from PIL import Image, ImageOps
-
+    if cancelled and cancelled():
+        return
     if progress:
         progress(10)
 
+    _register_optional_image_openers()
     with Image.open(src) as raw:
-        img = ImageOps.exif_transpose(raw)
-
-    try:
-        has_transparency = (
-            img.mode in ("RGBA", "LA")
-            or "transparency" in img.info
-        )
-        if has_transparency:
-            background = Image.new("RGB", img.size, (255, 255, 255))
+        frame_count = getattr(raw, "n_frames", 1)
+        for index in range(frame_count):
+            if cancelled and cancelled():
+                return
+            raw.seek(index)
+            img = _prepare_pdf_image(raw)
             try:
-                with img.convert("RGBA") as rgba:
-                    alpha = rgba.getchannel("A")
-                    try:
-                        background.paste(rgba, mask=alpha)
-                    finally:
-                        alpha.close()
-            except Exception:
-                background.close()
-                raise
-            img.close()
-            img = background
-        elif img.mode != "RGB":
-            converted = img.convert("RGB")
-            img.close()
-            img = converted
-
-        if progress:
-            progress(60)
-
-        img.save(dst, "PDF", resolution=72.0)
-    finally:
-        img.close()
+                img.save(
+                    str(dst),
+                    "PDF",
+                    resolution=72.0,
+                    append=index > 0,
+                )
+            finally:
+                img.close()
+            if progress:
+                progress(10 + int(80 * (index + 1) / frame_count))
 
     if progress:
         progress(95)
@@ -524,6 +640,15 @@ class PdfWorker(BaseConverterWorker):
             else:
                 raise RuntimeError(f"Unsupported PDF target: {out_ext}")
             self.progress.emit(95)
+            return
+
+        if out_ext == ".pdf" and in_ext in _COMIC_TO_PDF_EXTS:
+            _comic_to_pdf(
+                self.input_path,
+                self.output_path,
+                progress=self.progress.emit,
+                cancelled=lambda: self._cancel,
+            )
             return
 
         if out_ext == ".pdf" and in_ext in _IMAGE_TO_PDF_EXTS:

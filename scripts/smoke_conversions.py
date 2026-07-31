@@ -12,12 +12,14 @@ Usage:
 
 Exit code is non-zero if any required (non-skipped) conversion fails.
 """
+
 from __future__ import annotations
 
 import argparse
 import io
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -26,6 +28,7 @@ import tempfile
 import time
 import traceback
 import zipfile
+import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +47,7 @@ from cove_converter.engines import WORKER_REGISTRY  # noqa: E402
 
 # ---- Optional-dependency probes -------------------------------------------
 
+
 def _probe_module(name: str) -> str | None:
     try:
         __import__(name)
@@ -60,16 +64,18 @@ def _probe_binary(name: str) -> str | None:
 
 # Keyed by SUPPORTED_FORMATS engine name.
 ENGINE_DEPS: dict[str, list[Callable[[], str | None]]] = {
-    "Pillow":      [lambda: _probe_module("PIL")],
-    "FFmpeg":      [lambda: _probe_binary("ffmpeg")],
-    "Pandoc":      [lambda: _probe_binary("pandoc")],
-    "Pdf":         [lambda: _probe_module("pypdf"),
-                    lambda: _probe_module("xhtml2pdf"),
-                    lambda: _probe_binary("pandoc")],
-    "Subtitle":    [],
+    "Pillow": [lambda: _probe_module("PIL")],
+    "FFmpeg": [lambda: _probe_binary("ffmpeg")],
+    "Pandoc": [lambda: _probe_binary("pandoc")],
+    "Pdf": [
+        lambda: _probe_module("pypdf"),
+        lambda: _probe_module("xhtml2pdf"),
+        lambda: _probe_binary("pandoc"),
+    ],
+    "Subtitle": [],
     "Spreadsheet": [lambda: _probe_module("openpyxl")],
-    "Archive":     [],
-    "Data":        [lambda: _probe_module("yaml")],
+    "Archive": [],
+    "Data": [lambda: _probe_module("yaml")],
 }
 
 # Per-extension extra requirements (HEIC needs pillow-heif, etc.).
@@ -120,8 +126,10 @@ def _gen_html(dest: Path) -> Path:
 
 
 def _gen_json(dest: Path) -> Path:
-    dest.write_text(json.dumps({"name": "smoke", "items": [1, 2, 3]}, indent=2) + "\n",
-                    encoding="utf-8")
+    dest.write_text(
+        json.dumps({"name": "smoke", "items": [1, 2, 3]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return dest
 
 
@@ -130,13 +138,35 @@ def _gen_yaml(dest: Path) -> Path:
     return dest
 
 
+def _gen_json_lines(dest: Path) -> Path:
+    records = ({"name": "smoke", "index": 1}, {"name": "test", "index": 2})
+    dest.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    return dest
+
+
+def _gen_plist(dest: Path) -> Path:
+    dest.write_bytes(
+        plistlib.dumps({"name": "smoke", "items": [1, 2, 3]}, fmt=plistlib.FMT_XML)
+    )
+    return dest
+
+
 def _gen_csv(dest: Path) -> Path:
     dest.write_text("a,b,c\n1,2,3\n4,5,6\n", encoding="utf-8")
     return dest
 
 
+def _gen_tsv(dest: Path) -> Path:
+    dest.write_text("a\tb\tc\n1\t2\t3\n4\t5\t6\n", encoding="utf-8")
+    return dest
+
+
 def _gen_xlsx(dest: Path) -> Path:
     from openpyxl import Workbook
+
     wb = Workbook()
     ws = wb.active
     ws.append(["a", "b", "c"])
@@ -171,40 +201,152 @@ def _gen_vtt(dest: Path) -> Path:
     return dest
 
 
+def _gen_ass(dest: Path) -> Path:
+    dest.write_text(
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,"
+        "&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n",
+        encoding="utf-8",
+    )
+    return dest
+
+
+def _gen_ssa(dest: Path) -> Path:
+    dest.write_text(
+        "[Script Info]\n"
+        "ScriptType: v4.00\n\n"
+        "[V4 Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, "
+        "Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding\n"
+        "Style: Default,Arial,20,16777215,65535,65535,0,0,0,1,2,0,2,"
+        "10,10,10,0,1\n\n"
+        "[Events]\n"
+        "Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\n"
+        "Dialogue: Marked=0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n",
+        encoding="utf-8",
+    )
+    return dest
+
+
+def _gen_lrc(dest: Path) -> Path:
+    dest.write_text("[00:01.00]Hello\n[00:03.00]World\n", encoding="utf-8")
+    return dest
+
+
+def _gen_sbv(dest: Path) -> Path:
+    dest.write_text(
+        "0:00:01.000,0:00:02.000\nHello\n\n0:00:03.000,0:00:04.000\nWorld\n",
+        encoding="utf-8",
+    )
+    return dest
+
+
 def _gen_zip(dest: Path) -> Path:
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("hello.txt", "hello\n")
     return dest
 
 
-def _gen_tar(dest: Path) -> Path:
-    with tarfile.open(dest, "w") as tf:
-        payload = b"hello\n"
-        info = tarfile.TarInfo(name="hello.txt")
+def _write_tar(
+    dest: Path,
+    mode: str,
+    *,
+    member_name: str = "hello.txt",
+    payload: bytes = b"hello\n",
+) -> Path:
+    with tarfile.open(dest, mode) as tf:
+        info = tarfile.TarInfo(name=member_name)
         info.size = len(payload)
         info.mtime = int(time.time())
         tf.addfile(info, io.BytesIO(payload))
     return dest
+
+
+def _gen_tar(dest: Path) -> Path:
+    return _write_tar(dest, "w")
 
 
 def _gen_targz(dest: Path) -> Path:
-    with tarfile.open(dest, "w:gz") as tf:
-        payload = b"hello\n"
-        info = tarfile.TarInfo(name="hello.txt")
-        info.size = len(payload)
-        info.mtime = int(time.time())
-        tf.addfile(info, io.BytesIO(payload))
+    return _write_tar(dest, "w:gz")
+
+
+def _gen_tarbz2(dest: Path) -> Path:
+    return _write_tar(dest, "w:bz2")
+
+
+def _gen_tarxz(dest: Path) -> Path:
+    return _write_tar(dest, "w:xz")
+
+
+def _comic_page() -> bytes:
+    from PIL import Image
+
+    page = Image.new("RGB", (32, 48), (200, 50, 50))
+    payload = io.BytesIO()
+    page.save(payload, format="PNG")
+    return payload.getvalue()
+
+
+def _gen_cbz(dest: Path) -> Path:
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("page001.png", _comic_page())
     return dest
+
+
+def _gen_cbt(dest: Path) -> Path:
+    return _write_tar(
+        dest,
+        "w",
+        member_name="page001.png",
+        payload=_comic_page(),
+    )
 
 
 def _gen_image(dest: Path) -> Path:
     from PIL import Image
-    img = Image.new("RGB", (32, 32), (200, 50, 50))
-    # Pick a format Pillow can always save.
+
     suffix = dest.suffix.lower()
-    fmt = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP",
-           ".bmp": "BMP", ".tiff": "TIFF", ".tif": "TIFF",
-           ".ico": "ICO", ".heic": "HEIF", ".heif": "HEIF"}.get(suffix)
+    mode = "1" if suffix == ".pbm" else "L" if suffix == ".pgm" else "RGB"
+    size = (128, 128) if suffix == ".icns" else (32, 32)
+    color = 1 if mode == "1" else 160 if mode == "L" else (200, 50, 50)
+    img = Image.new(mode, size, color)
+    fmt = {
+        ".png": "PNG",
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".jpe": "JPEG",
+        ".jfif": "JPEG",
+        ".webp": "WEBP",
+        ".bmp": "BMP",
+        ".tiff": "TIFF",
+        ".tif": "TIFF",
+        ".ico": "ICO",
+        ".heic": "HEIF",
+        ".heif": "HEIF",
+        ".avif": "AVIF",
+        ".jp2": "JPEG2000",
+        ".j2k": "JPEG2000",
+        ".jpx": "JPEG2000",
+        ".tga": "TGA",
+        ".pcx": "PCX",
+        ".ppm": "PPM",
+        ".pgm": "PPM",
+        ".pbm": "PPM",
+        ".dds": "DDS",
+        ".icns": "ICNS",
+    }[suffix]
     img.save(dest, format=fmt)
     return dest
 
@@ -212,8 +354,16 @@ def _gen_image(dest: Path) -> Path:
 # Sample audio/video generation goes through ffmpeg's lavfi sources so we
 # don't ship binary blobs. Cheap: ~0.5s clip at 8kHz / 64x48.
 
+
 def _ffmpeg_gen(args: list[str], dest: Path) -> Path:
-    cmd = [shutil.which("ffmpeg") or "ffmpeg", "-y", "-loglevel", "error", *args, str(dest)]
+    cmd = [
+        shutil.which("ffmpeg") or "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        *args,
+        str(dest),
+    ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"ffmpeg exited {proc.returncode}")
@@ -224,9 +374,39 @@ def _gen_audio(dest: Path) -> Path:
     # 44.1 kHz stereo: libvorbis/libopus reject the converter's 320 kbps
     # default for mono input. Stereo at 44.1 matches real-world audio and
     # keeps the FLV (44100|22050|11025) constraint satisfied.
+    suffix = dest.suffix.lower()
+    if suffix == ".amr":
+        return _ffmpeg_gen(
+            [
+                "-f",
+                "lavfi",
+                "-t",
+                "0.5",
+                "-i",
+                "sine=frequency=440:sample_rate=8000",
+                "-ac",
+                "1",
+                "-c:a",
+                "libopencore_amrnb",
+                "-b:a",
+                "12.2k",
+            ],
+            dest,
+        )
+    args = [
+        "-f",
+        "lavfi",
+        "-t",
+        "0.5",
+        "-i",
+        "sine=frequency=440:sample_rate=44100",
+        "-ac",
+        "2",
+    ]
+    if suffix == ".weba":
+        args.extend(["-f", "webm"])
     return _ffmpeg_gen(
-        ["-f", "lavfi", "-t", "0.5",
-         "-i", "sine=frequency=440:sample_rate=44100", "-ac", "2"],
+        args,
         dest,
     )
 
@@ -241,8 +421,16 @@ def _gen_video(dest: Path) -> Path:
         # GIF can't carry audio. Force pal8 because lavfi's default ``gbrap``
         # output is rejected by downstream encoders like libvpx-vp9.
         return _ffmpeg_gen(
-            ["-f", "lavfi", "-t", "0.5", "-i", "color=c=red:s=128x96:r=25",
-             "-vf", "format=pal8"],
+            [
+                "-f",
+                "lavfi",
+                "-t",
+                "0.5",
+                "-i",
+                "color=c=red:s=128x96:r=25",
+                "-vf",
+                "format=pal8",
+            ],
             dest,
         )
     if suffix == ".3gp":
@@ -250,18 +438,67 @@ def _gen_video(dest: Path) -> Path:
         # codec args ffmpeg expects for the container instead of the lavfi
         # defaults.
         return _ffmpeg_gen(
-            ["-f", "lavfi", "-t", "0.5", "-i", "color=c=red:s=128x96:r=25",
-             "-f", "lavfi", "-t", "0.5",
-             "-i", "sine=frequency=440:sample_rate=8000",
-             "-ac", "1", "-c:v", "h263", "-c:a", "libopencore_amrnb",
-             "-b:a", "12.2k", "-shortest"],
+            [
+                "-f",
+                "lavfi",
+                "-t",
+                "0.5",
+                "-i",
+                "color=c=red:s=128x96:r=25",
+                "-f",
+                "lavfi",
+                "-t",
+                "0.5",
+                "-i",
+                "sine=frequency=440:sample_rate=8000",
+                "-ac",
+                "1",
+                "-c:v",
+                "h263",
+                "-c:a",
+                "libopencore_amrnb",
+                "-b:a",
+                "12.2k",
+                "-shortest",
+            ],
             dest,
         )
+    if suffix == ".dv":
+        return _ffmpeg_gen(
+            [
+                "-f",
+                "lavfi",
+                "-t",
+                "0.5",
+                "-i",
+                "color=c=red:s=720x576:r=25",
+                "-c:v",
+                "dvvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+            ],
+            dest,
+        )
+    audio_rate = "48000" if suffix == ".mxf" else "44100"
     return _ffmpeg_gen(
-        ["-f", "lavfi", "-t", "0.5", "-i", "color=c=red:s=128x96:r=25",
-         "-f", "lavfi", "-t", "0.5",
-         "-i", "sine=frequency=440:sample_rate=44100",
-         "-ac", "2", "-shortest"],
+        [
+            "-f",
+            "lavfi",
+            "-t",
+            "0.5",
+            "-i",
+            "color=c=red:s=128x96:r=25",
+            "-f",
+            "lavfi",
+            "-t",
+            "0.5",
+            "-i",
+            f"sine=frequency=440:sample_rate={audio_rate}",
+            "-ac",
+            "2",
+            "-shortest",
+        ],
         dest,
     )
 
@@ -290,6 +527,85 @@ def _gen_pdf(dest: Path) -> Path:
 
 # Per-extension generator registry. Anything not listed falls back to
 # (skip with "no sample generator").
+_IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".jpe",
+    ".jfif",
+    ".webp",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".ico",
+    ".heic",
+    ".heif",
+    ".avif",
+    ".jp2",
+    ".j2k",
+    ".jpx",
+    ".tga",
+    ".pcx",
+    ".ppm",
+    ".pgm",
+    ".pbm",
+    ".dds",
+    ".icns",
+)
+_AUDIO_EXTENSIONS = (
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".m4a",
+    ".aac",
+    ".opus",
+    ".ac3",
+    ".mp2",
+    ".spx",
+    ".caf",
+    ".au",
+    ".wv",
+    ".voc",
+    ".w64",
+    ".mka",
+    ".m4b",
+    ".oga",
+    ".aif",
+    ".tta",
+    ".amr",
+    ".weba",
+    ".wma",
+    ".aiff",
+)
+_VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".mov",
+    ".avi",
+    ".flv",
+    ".wmv",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".3gp",
+    ".ts",
+    ".gif",
+    ".mxf",
+    ".rm",
+    ".vob",
+    ".asf",
+    ".ogv",
+    ".m2ts",
+    ".mts",
+    ".f4v",
+    ".swf",
+    ".dv",
+    ".y4m",
+    ".ivf",
+)
+
 SAMPLE_GENERATORS: dict[str, Callable[[Path], Path]] = {
     # docs / text
     ".txt": _gen_txt,
@@ -300,74 +616,112 @@ SAMPLE_GENERATORS: dict[str, Callable[[Path], Path]] = {
     ".json": _gen_json,
     ".yaml": _gen_yaml,
     ".yml": _gen_yaml,
+    ".ndjson": _gen_json_lines,
+    ".jsonl": _gen_json_lines,
+    ".plist": _gen_plist,
     # spreadsheets
     ".csv": _gen_csv,
+    ".tsv": _gen_tsv,
     ".xlsx": _gen_xlsx,
     # subtitles
     ".srt": _gen_srt,
     ".vtt": _gen_vtt,
+    ".ass": _gen_ass,
+    ".ssa": _gen_ssa,
+    ".lrc": _gen_lrc,
+    ".sbv": _gen_sbv,
     # archives
     ".zip": _gen_zip,
     ".tar": _gen_tar,
     ".tgz": _gen_targz,
     ".tar.gz": _gen_targz,
-    # images (Pillow-backed)
-    ".png": _gen_image,
-    ".jpg": _gen_image,
-    ".jpeg": _gen_image,
-    ".webp": _gen_image,
-    ".bmp": _gen_image,
-    ".tiff": _gen_image,
-    ".tif": _gen_image,
-    ".ico": _gen_image,
-    ".heic": _gen_image,
-    ".heif": _gen_image,
+    ".tar.bz2": _gen_tarbz2,
+    ".tbz2": _gen_tarbz2,
+    ".tar.xz": _gen_tarxz,
+    ".txz": _gen_tarxz,
+    # comics
+    ".cbz": _gen_cbz,
+    ".cbt": _gen_cbt,
     # PDF
     ".pdf": _gen_pdf,
-    # audio (ffmpeg-backed)
-    ".mp3": _gen_audio, ".wav": _gen_audio, ".flac": _gen_audio,
-    ".ogg": _gen_audio, ".m4a": _gen_audio, ".aac": _gen_audio,
-    ".opus": _gen_audio, ".wma": _gen_audio, ".aiff": _gen_audio,
-    # video (ffmpeg-backed)
-    ".mp4": _gen_video, ".mkv": _gen_video, ".webm": _gen_video,
-    ".mov": _gen_video, ".avi": _gen_video, ".flv": _gen_video,
-    ".wmv": _gen_video, ".m4v": _gen_video, ".mpg": _gen_video,
-    ".mpeg": _gen_video, ".3gp": _gen_video, ".ts": _gen_video,
-    ".gif": _gen_video,  # treated as video source (matches routing)
-    # extra doc inputs we need samples for if Pandoc tests them as targets
-    # (docx/odt/rtf/epub/tex generated via pandoc on demand below)
+}
+
+for extension in _IMAGE_EXTENSIONS:
+    SAMPLE_GENERATORS[extension] = _gen_image
+for extension in _AUDIO_EXTENSIONS:
+    SAMPLE_GENERATORS[extension] = _gen_audio
+for extension in _VIDEO_EXTENSIONS:
+    SAMPLE_GENERATORS[extension] = _gen_video
+
+
+_PANDOC_WRITERS = {
+    ".docx": "docx",
+    ".odt": "odt",
+    ".rtf": "rtf",
+    ".epub": "epub",
+    ".tex": "latex",
+    ".rst": "rst",
+    ".org": "org",
+    ".textile": "textile",
+    ".typst": "typst",
+    ".ipynb": "ipynb",
+    ".fb2": "fb2",
+    ".opml": "opml",
+    ".muse": "muse",
+    ".man": "man",
+    ".native": "native",
+    ".mediawiki": "mediawiki",
+    ".wiki": "mediawiki",
+    ".dokuwiki": "dokuwiki",
+    ".jira": "jira",
+    ".docbook": "docbook",
 }
 
 
-def generate_via_pandoc(dest: Path, *, source_md: str | None = None) -> Path:
-    """For doc formats we can't author by hand (docx/odt/rtf/epub/tex), let
-    pandoc convert a tiny markdown source. Used only when pandoc is on PATH."""
+def generate_via_pandoc(
+    dest: Path,
+    *,
+    writer: str,
+    source_md: str | None = None,
+) -> Path:
+    """Use Pandoc to synthesize a document sample with an explicit writer."""
     pandoc = shutil.which("pandoc")
     if not pandoc:
         raise RuntimeError("pandoc unavailable; cannot synthesise doc sample")
     md = source_md or "# Smoke\n\nParagraph one.\n"
-    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as tf:
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".md", delete=False, encoding="utf-8"
+    ) as tf:
         tf.write(md)
         src = Path(tf.name)
     try:
-        proc = subprocess.run([pandoc, str(src), "-o", str(dest)],
-                              capture_output=True, text=True)
+        proc = subprocess.run(
+            [pandoc, str(src), "--to", writer, "-o", str(dest)],
+            capture_output=True,
+            text=True,
+        )
         if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or f"pandoc exited {proc.returncode}")
+            raise RuntimeError(
+                proc.stderr.strip() or f"pandoc exited {proc.returncode}"
+            )
     finally:
         src.unlink(missing_ok=True)
     return dest
 
 
 def _gen_pandoc_doc(dest: Path) -> Path:
-    return generate_via_pandoc(dest)
+    return generate_via_pandoc(
+        dest,
+        writer=_PANDOC_WRITERS[dest.suffix.lower()],
+    )
 
 
-for ext in (".docx", ".odt", ".rtf", ".epub", ".tex"):
-    SAMPLE_GENERATORS.setdefault(ext, _gen_pandoc_doc)
+for extension in _PANDOC_WRITERS:
+    SAMPLE_GENERATORS.setdefault(extension, _gen_pandoc_doc)
 
 
 # ---- Output validators -----------------------------------------------------
+
 
 def _validate_nonempty(path: Path) -> None:
     if not path.exists():
@@ -391,6 +745,7 @@ def _validate_json(path: Path) -> None:
 def _validate_yaml(path: Path) -> None:
     _validate_nonempty(path)
     import yaml
+
     yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
@@ -402,9 +757,31 @@ def _validate_csv(path: Path) -> None:
         raise AssertionError("CSV has no rows")
 
 
+def _validate_tsv(path: Path) -> None:
+    _validate_csv(path)
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+    if not any("\t" in line for line in lines):
+        raise AssertionError("TSV has no tab-delimited rows")
+
+
+def _validate_json_lines(path: Path) -> None:
+    _validate_nonempty(path)
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+    if not lines:
+        raise AssertionError("JSON Lines output has no records")
+    for line in lines:
+        json.loads(line)
+
+
+def _validate_plist(path: Path) -> None:
+    _validate_nonempty(path)
+    plistlib.loads(path.read_bytes())
+
+
 def _validate_xlsx(path: Path) -> None:
     _validate_nonempty(path)
     from openpyxl import load_workbook
+
     wb = load_workbook(filename=str(path), read_only=True)
     try:
         ws = wb.active
@@ -419,30 +796,129 @@ def _validate_zip(path: Path) -> None:
     _validate_nonempty(path)
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
-    if "hello.txt" not in names:
-        raise AssertionError(f"ZIP missing hello.txt; has {names!r}")
+    if not names:
+        raise AssertionError("ZIP has no members")
 
 
 def _validate_tar(path: Path) -> None:
     _validate_nonempty(path)
-    with tarfile.open(path, "r") as tf:
+    with tarfile.open(path, "r:*") as tf:
         names = tf.getnames()
-    if "hello.txt" not in names:
-        raise AssertionError(f"TAR missing hello.txt; has {names!r}")
+    if not names:
+        raise AssertionError("TAR has no members")
+
+
+def _validate_comic_payload(name: str, payload: bytes) -> None:
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            image.verify()
+    except Exception as exc:
+        raise AssertionError(f"invalid comic image member {name!r}") from exc
+
+
+def _validate_cbz(path: Path) -> None:
+    _validate_nonempty(path)
+    with zipfile.ZipFile(path) as archive:
+        images = [
+            name
+            for name in archive.namelist()
+            if Path(name).suffix.lower() in _IMAGE_EXTENSIONS
+        ]
+        if not images:
+            raise AssertionError("CBZ has no image members")
+        _validate_comic_payload(images[0], archive.read(images[0]))
+
+
+def _validate_cbt(path: Path) -> None:
+    _validate_nonempty(path)
+    with tarfile.open(path, "r:*") as archive:
+        images = [
+            member
+            for member in archive.getmembers()
+            if member.isfile() and Path(member.name).suffix.lower() in _IMAGE_EXTENSIONS
+        ]
+        if not images:
+            raise AssertionError("CBT has no image members")
+        extracted = archive.extractfile(images[0])
+        if extracted is None:
+            raise AssertionError(f"cannot read CBT member {images[0].name!r}")
+        _validate_comic_payload(images[0].name, extracted.read())
 
 
 def _validate_image(path: Path) -> None:
     _validate_nonempty(path)
     from PIL import Image
+
     with Image.open(path) as im:
         im.verify()  # cheap structural check
 
 
-def _validate_subtitle(path: Path) -> None:
+def _validate_arrow_subtitle(path: Path) -> None:
     _validate_nonempty(path)
     text = path.read_text(encoding="utf-8")
     if "-->" not in text:
         raise AssertionError("subtitle output has no cue timing line")
+
+
+def _validate_ass(path: Path) -> None:
+    _validate_nonempty(path)
+    text = path.read_text(encoding="utf-8")
+    if "[Events]" not in text or "Dialogue:" not in text:
+        raise AssertionError("ASS/SSA output has no dialogue events")
+
+
+def _validate_lrc(path: Path) -> None:
+    _validate_nonempty(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not any(line.startswith("[") and "]" in line for line in lines):
+        raise AssertionError("LRC output has no timestamped lyrics")
+
+
+def _validate_sbv(path: Path) -> None:
+    _validate_nonempty(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not any("," in line and ":" in line for line in lines):
+        raise AssertionError("SBV output has no timestamp range")
+
+
+def _validate_xml(path: Path) -> None:
+    _validate_nonempty(path)
+    ET.parse(path)
+
+
+def _validate_media_stream(path: Path, expected_type: str) -> None:
+    _validate_nonempty(path)
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return
+    proc = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    stream_types = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    if proc.returncode != 0 or expected_type not in stream_types:
+        detail = proc.stderr.strip() or f"streams={sorted(stream_types)!r}"
+        raise AssertionError(f"no {expected_type} stream in {path}: {detail}")
+
+
+def _validate_audio(path: Path) -> None:
+    _validate_media_stream(path, "audio")
+
+
+def _validate_video(path: Path) -> None:
+    _validate_media_stream(path, "video")
 
 
 def _validate_text(path: Path) -> None:
@@ -457,20 +933,51 @@ def _validate_text(path: Path) -> None:
 VALIDATORS: dict[str, Callable[[Path], None]] = {
     ".pdf": _validate_pdf,
     ".json": _validate_json,
-    ".yaml": _validate_yaml, ".yml": _validate_yaml,
+    ".yaml": _validate_yaml,
+    ".yml": _validate_yaml,
+    ".ndjson": _validate_json_lines,
+    ".jsonl": _validate_json_lines,
+    ".plist": _validate_plist,
     ".csv": _validate_csv,
+    ".tsv": _validate_tsv,
     ".xlsx": _validate_xlsx,
     ".zip": _validate_zip,
     ".tar": _validate_tar,
-    ".tgz": _validate_tar, ".tar.gz": _validate_tar,
-    ".png": _validate_image, ".jpg": _validate_image, ".jpeg": _validate_image,
-    ".webp": _validate_image, ".bmp": _validate_image, ".tiff": _validate_image,
-    ".tif": _validate_image, ".ico": _validate_image,
-    ".heic": _validate_image, ".heif": _validate_image,
-    ".srt": _validate_subtitle, ".vtt": _validate_subtitle,
-    ".txt": _validate_text, ".md": _validate_text,
-    ".html": _validate_text, ".htm": _validate_text,
+    ".tgz": _validate_tar,
+    ".tar.gz": _validate_tar,
+    ".tar.bz2": _validate_tar,
+    ".tbz2": _validate_tar,
+    ".tar.xz": _validate_tar,
+    ".txz": _validate_tar,
+    ".cbz": _validate_cbz,
+    ".cbt": _validate_cbt,
+    ".srt": _validate_arrow_subtitle,
+    ".vtt": _validate_arrow_subtitle,
+    ".ass": _validate_ass,
+    ".ssa": _validate_ass,
+    ".lrc": _validate_lrc,
+    ".sbv": _validate_sbv,
+    ".txt": _validate_text,
+    ".md": _validate_text,
+    ".html": _validate_text,
+    ".htm": _validate_text,
+    ".rtf": _validate_text,
+    ".odt": _validate_zip,
+    ".docx": _validate_zip,
+    ".epub": _validate_zip,
+    ".tex": _validate_text,
+    ".adoc": _validate_text,
+    ".tei": _validate_xml,
+    ".icml": _validate_xml,
+    ".pptx": _validate_zip,
 }
+
+for extension in _IMAGE_EXTENSIONS:
+    VALIDATORS[extension] = _validate_image
+for extension in _AUDIO_EXTENSIONS:
+    VALIDATORS[extension] = _validate_audio
+for extension in _VIDEO_EXTENSIONS:
+    VALIDATORS[extension] = _validate_video
 
 
 def validate(out_ext: str, out_path: Path) -> None:
@@ -479,6 +986,7 @@ def validate(out_ext: str, out_path: Path) -> None:
 
 
 # ---- Matrix builder --------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class Route:
@@ -499,6 +1007,7 @@ def build_matrix(formats: dict[str, routing.FormatInfo] | None = None) -> list[R
 
 
 # ---- Worker driver ---------------------------------------------------------
+
 
 def _run_worker(engine: str, in_path: Path, out_path: Path) -> None:
     """Invoke a worker's ``_convert`` synchronously without spawning a QThread.
@@ -562,8 +1071,9 @@ def _format_route(r: Route) -> str:
 _failed_samples: dict[str, str] = {}
 
 
-def _ensure_sample(in_ext: str, samples_dir: Path,
-                   cache: dict[str, Path]) -> tuple[Path | None, str]:
+def _ensure_sample(
+    in_ext: str, samples_dir: Path, cache: dict[str, Path]
+) -> tuple[Path | None, str]:
     """Return (path, reason). On failure path is None and reason explains."""
     if in_ext in cache:
         return cache[in_ext], ""
@@ -592,8 +1102,7 @@ def _ensure_sample(in_ext: str, samples_dir: Path,
     return dest, ""
 
 
-def run_smoke(routes: list[Route], *, work_dir: Path,
-              quiet: bool = False) -> Report:
+def run_smoke(routes: list[Route], *, work_dir: Path, quiet: bool = False) -> Report:
     samples_dir = work_dir / "samples"
     outputs_dir = work_dir / "outputs"
     samples_dir.mkdir(parents=True, exist_ok=True)
@@ -651,10 +1160,12 @@ def print_summary(report: Report) -> None:
     total = sum(counts.values())
     print()
     print("=" * 60)
-    print(f"Total routes: {total}   "
-          f"PASS={counts.get(PASS, 0)}  "
-          f"FAIL={counts.get(FAIL, 0)}  "
-          f"SKIP={counts.get(SKIP, 0)}")
+    print(
+        f"Total routes: {total}   "
+        f"PASS={counts.get(PASS, 0)}  "
+        f"FAIL={counts.get(FAIL, 0)}  "
+        f"SKIP={counts.get(SKIP, 0)}"
+    )
 
     if report.fails():
         print("\nFailures:")
@@ -676,14 +1187,28 @@ def print_summary(report: Report) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--engine", action="append", default=[],
-                        help="Restrict to a worker engine (repeatable).")
-    parser.add_argument("--input", action="append", default=[],
-                        help="Restrict to an input extension (repeatable).")
-    parser.add_argument("--quiet", action="store_true",
-                        help="Only print the summary, not per-route lines.")
-    parser.add_argument("--keep-temp", action="store_true",
-                        help="Leave the temp work dir on disk (for debugging).")
+    parser.add_argument(
+        "--engine",
+        action="append",
+        default=[],
+        help="Restrict to a worker engine (repeatable).",
+    )
+    parser.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help="Restrict to an input extension (repeatable).",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Only print the summary, not per-route lines.",
+    )
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="Leave the temp work dir on disk (for debugging).",
+    )
     args = parser.parse_args(argv)
 
     routes = build_matrix()

@@ -24,6 +24,12 @@ from cove_converter.settings import (
     ENCODER_KEY_MAP,
     ENCODER_LABEL_MAP,
     ENCODER_OPTIONS,
+    M4A_CODEC_KEY_MAP,
+    M4A_CODEC_LABEL_MAP,
+    M4A_CODEC_OPTIONS,
+    VIDEO_CODEC_KEY_MAP,
+    VIDEO_CODEC_LABEL_MAP,
+    VIDEO_CODEC_OPTIONS,
     VIDEO_PRESETS,
     ConversionSettings,
 )
@@ -208,6 +214,15 @@ class QualityDialog(QDialog):
         self.enable_check.toggled.connect(self._on_toggle)
         v.addWidget(self.enable_check)
 
+        # Output codec choices are independent of the custom-quality toggle.
+        v.addLayout(self._labeled_row("Video codec (MP4 / MKV)"))
+        self.video_codec_combo = QComboBox(body)
+        self.video_codec_combo.addItems(list(VIDEO_CODEC_OPTIONS))
+        self.video_codec_combo.setCurrentText(
+            VIDEO_CODEC_LABEL_MAP.get(getattr(current, "video_codec", "h264"), "H.264")
+        )
+        v.addWidget(self.video_codec_combo)
+
         # Video preset (full ffmpeg list — round-trips every supported value).
         v.addLayout(self._labeled_row("Video preset"))
         self.video_combo = QComboBox(body)
@@ -241,6 +256,14 @@ class QualityDialog(QDialog):
             self.audio_combo.setCurrentText("192k")
         v.addWidget(self.audio_combo)
         self._tracked.append(self.audio_combo)
+
+        v.addLayout(self._labeled_row("M4A audio codec"))
+        self.m4a_codec_combo = QComboBox(body)
+        self.m4a_codec_combo.addItems(list(M4A_CODEC_OPTIONS))
+        self.m4a_codec_combo.setCurrentText(
+            M4A_CODEC_LABEL_MAP.get(getattr(current, "m4a_codec", "aac"), "AAC")
+        )
+        v.addWidget(self.m4a_codec_combo)
 
         # Max concurrent (slider)
         self._conc_label = QLabel(f"Max concurrent · {current.max_concurrent}")
@@ -393,5 +416,11 @@ class QualityDialog(QDialog):
             webp_quality=self.webp.value(),
             max_concurrent=self.concurrent.value(),
             encoder_pref=ENCODER_KEY_MAP.get(self.encoder_combo.currentText(), "auto"),
+            video_codec=VIDEO_CODEC_KEY_MAP.get(
+                self.video_codec_combo.currentText(), "h264"
+            ),
+            m4a_codec=M4A_CODEC_KEY_MAP.get(
+                self.m4a_codec_combo.currentText(), "aac"
+            ),
             pdf_enhance_dpi=self._initial_pdf_enhance_dpi,
         )

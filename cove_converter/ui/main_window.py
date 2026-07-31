@@ -85,6 +85,15 @@ from cove_converter.ui.theme import (
 
 _COL_FILE, _COL_TARGET, _COL_PROGRESS, _COL_STATUS = range(4)
 _MAX_LOG_ENTRIES = 200
+_SUBTITLE_STYLE_WARNING = (
+    "Warning: converting ASS/SSA to SRT removes styling, karaoke, and positioning."
+)
+
+
+def _target_tooltip(source_ext: str, target_ext: str) -> str:
+    if source_ext in {".ass", ".ssa"} and target_ext == ".srt":
+        return _SUBTITLE_STYLE_WARNING
+    return "Choose the output format"
 
 
 # ---------------------------------------------------------------------------
@@ -1220,6 +1229,7 @@ class MainWindow(QMainWindow):
 
         target_combo = _TargetCombo(ext, row.target_ext, parent=self.table)
         target_combo.setMinimumWidth(86)
+        target_combo.setToolTip(_target_tooltip(ext, row.target_ext))
         target_combo.currentTextChanged.connect(
             lambda new_ext, rr=row: self._on_target_changed(rr, new_ext),
         )
@@ -1400,6 +1410,9 @@ class MainWindow(QMainWindow):
             self._set_status(index, "Pending")
             self._set_progress(index, 0)
         row.target_ext = ext
+        target_combo = cells.get("target")
+        if target_combo is not None:
+            target_combo.setToolTip(_target_tooltip(effective_suffix(row.path), ext))
         check = cells.get("enhance_pdf")
         if check is not None:
             check.setVisible(ext == ".pdf")

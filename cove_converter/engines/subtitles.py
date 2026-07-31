@@ -15,8 +15,12 @@ Conversion rules:
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
+from cove_converter.binaries import FFMPEG, resolve
 from cove_converter.engines.base import BaseConverterWorker
 
 
@@ -37,6 +41,19 @@ _TS_VTT_LINE = re.compile(
     rf"^{_VTT_TS}\s*-->\s*{_VTT_TS}[^\r\n]*$",
     re.MULTILINE,
 )
+_SBV_TIMING_LINE = re.compile(
+    r"^(?P<start_h>\d+):(?P<start_m>\d{2}):(?P<start_s>\d{2})"
+    r"\.(?P<start_ms>\d{3}),(?P<end_h>\d+):(?P<end_m>\d{2}):"
+    r"(?P<end_s>\d{2})\.(?P<end_ms>\d{3})$"
+)
+_MANUAL_FORMATS = frozenset({".srt", ".vtt", ".sbv"})
+_FFMPEG_MUXERS = {
+    ".srt": "srt",
+    ".vtt": "webvtt",
+    ".ass": "ass",
+    ".ssa": "ass",
+    ".lrc": "lrc",
+}
 
 
 def _vtt_to_srt_ts(main: str) -> str:
@@ -144,21 +161,152 @@ def _vtt_to_srt(text: str) -> str:
     return "\n\n".join(out_blocks) + "\n"
 
 
+def _sbv_to_srt(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    out_blocks: list[str] = []
+    for cue_number, raw_block in enumerate(text.split("\n\n"), start=1):
+        lines = raw_block.split("\n")
+        if not lines:
+            raise RuntimeError(f"Invalid SBV cue {cue_number}: missing timing")
+        match = _SBV_TIMING_LINE.fullmatch(lines[0].strip())
+        if match is None:
+            raise RuntimeError(
+                f"Invalid SBV timing in cue {cue_number}: {lines[0]!r}"
+            )
+        start = (
+            f"{int(match['start_h']):02d}:{match['start_m']}:{match['start_s']},"
+            f"{match['start_ms']}"
+        )
+        end = (
+            f"{int(match['end_h']):02d}:{match['end_m']}:{match['end_s']},"
+            f"{match['end_ms']}"
+        )
+        out_blocks.append(
+            f"{len(out_blocks) + 1}\n{start} --> {end}\n" + "\n".join(lines[1:])
+        )
+    return "\n\n".join(out_blocks) + "\n"
+
+
+def _srt_to_sbv(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    out_blocks: list[str] = []
+    for cue_number, raw_block in enumerate(text.split("\n\n"), start=1):
+        lines = raw_block.split("\n")
+        if lines and lines[0].strip().isdigit():
+            lines = lines[1:]
+        if not lines:
+            raise RuntimeError(f"Invalid SRT cue {cue_number}: missing timing")
+        match = _TS_SRT_LINE.fullmatch(lines[0])
+        if match is None:
+            raise RuntimeError(
+                f"Invalid SRT timing in cue {cue_number}: {lines[0]!r}"
+            )
+        timing = (
+            f"{match.group(1)}.{match.group(2)},"
+            f"{match.group(3)}.{match.group(4)}"
+        )
+        out_blocks.append(timing + "\n" + "\n".join(lines[1:]))
+    return "\n\n".join(out_blocks) + "\n"
+
+
+def _manual_convert(text: str, in_ext: str, out_ext: str) -> str:
+    if in_ext == ".srt":
+        srt = text
+    elif in_ext == ".vtt":
+        srt = _vtt_to_srt(text)
+    elif in_ext == ".sbv":
+        srt = _sbv_to_srt(text)
+    else:
+        raise RuntimeError(f"Unsupported manual subtitle input: {in_ext}")
+
+    if out_ext == ".srt":
+        return srt
+    if out_ext == ".vtt":
+        return _srt_to_vtt(srt)
+    if out_ext == ".sbv":
+        return _srt_to_sbv(srt)
+    raise RuntimeError(f"Unsupported manual subtitle output: {out_ext}")
+
+
+def _no_window_kwargs() -> dict:
+    if sys.platform.startswith("win"):
+        return {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    return {}
+
+
 class SubtitleWorker(BaseConverterWorker):
+    def _run_ffmpeg(self, source: Path, target: Path, out_ext: str) -> None:
+        muxer = _FFMPEG_MUXERS[out_ext]
+        proc = subprocess.Popen(
+            [
+                resolve(FFMPEG),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-f",
+                muxer,
+                str(target),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_no_window_kwargs(),
+        )
+        stderr = ""
+        while True:
+            try:
+                _, stderr = proc.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if not self._cancel:
+                    continue
+                proc.terminate()
+                _, stderr = proc.communicate()
+                return
+        if proc.returncode != 0:
+            detail = stderr.strip()
+            message = f"ffmpeg subtitle conversion failed with code {proc.returncode}"
+            if detail:
+                message += f": {detail[-500:]}"
+            raise RuntimeError(message)
+
     def _convert(self) -> None:
         in_ext = self.input_path.suffix.lower()
         out_ext = self.output_path.suffix.lower()
         self.progress.emit(20)
 
-        text = _read_text(self.input_path)
-        self.progress.emit(50)
+        if in_ext in _MANUAL_FORMATS and out_ext in _MANUAL_FORMATS:
+            converted = _manual_convert(_read_text(self.input_path), in_ext, out_ext)
+            self.progress.emit(85)
+            self.output_path.write_text(converted, encoding="utf-8")
+            return
 
-        if in_ext == ".srt" and out_ext == ".vtt":
-            converted = _srt_to_vtt(text)
-        elif in_ext == ".vtt" and out_ext == ".srt":
-            converted = _vtt_to_srt(text)
+        self.progress.emit(50)
+        if in_ext == ".sbv":
+            with tempfile.TemporaryDirectory(prefix="cove-subtitles-") as temp_dir:
+                source = Path(temp_dir) / "source.srt"
+                source.write_text(
+                    _sbv_to_srt(_read_text(self.input_path)),
+                    encoding="utf-8",
+                )
+                self._run_ffmpeg(source, self.output_path, out_ext)
+        elif out_ext == ".sbv":
+            with tempfile.TemporaryDirectory(prefix="cove-subtitles-") as temp_dir:
+                target = Path(temp_dir) / "target.srt"
+                self._run_ffmpeg(self.input_path, target, ".srt")
+                if self._cancel:
+                    return
+                self.output_path.write_text(
+                    _srt_to_sbv(_read_text(target)),
+                    encoding="utf-8",
+                )
+        elif out_ext in _FFMPEG_MUXERS:
+            self._run_ffmpeg(self.input_path, self.output_path, out_ext)
         else:
             raise RuntimeError(f"SubtitleWorker cannot convert {in_ext} → {out_ext}")
-
         self.progress.emit(85)
-        self.output_path.write_text(converted, encoding="utf-8")
