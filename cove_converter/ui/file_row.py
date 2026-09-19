@@ -8,6 +8,18 @@ from cove_converter.routing import effective_stem, effective_suffix
 
 if TYPE_CHECKING:
     from cove_converter.engines.base import BaseConverterWorker
+    from cove_converter.settings import ConversionSettings
+
+
+@dataclass(frozen=True)
+class ConversionJob:
+    """Validated paths and a private settings copy captured at enqueue time."""
+
+    input_path: Path
+    output_path: Path
+    target_ext: str
+    engine: str
+    settings: ConversionSettings
 
 
 @dataclass(eq=False)
@@ -17,6 +29,7 @@ class FileRow:
     status: str = "Pending"
     progress: int = 0
     worker: BaseConverterWorker | None = field(default=None, repr=False)
+    job: ConversionJob | None = field(default=None, repr=False)
     # If set, overrides the computed path (used when the user chose to
     # rename duplicates in the overwrite-confirm dialog).
     override_output: Path | None = None
@@ -54,8 +67,8 @@ class FileRow:
 def unique_path(path: Path, reserved: set[Path] | None = None) -> Path:
     """Return ``path`` if it doesn't exist and isn't already reserved in this batch;
     otherwise append ``(1)``, ``(2)``… until an unused name is found."""
-    reserved = reserved or set()
-    if not path.exists() and path not in reserved:
+    reserved = {p.resolve() for p in (reserved or ())}
+    if not path.exists() and not path.is_symlink() and path.resolve() not in reserved:
         return path
     stem, parent = effective_stem(path), path.parent
     routed_suffix = effective_suffix(path)
@@ -64,6 +77,7 @@ def unique_path(path: Path, reserved: set[Path] | None = None) -> Path:
     suffix = path.name[-len(routed_suffix):] if routed_suffix else ""
     for i in range(1, 1000):
         candidate = parent / f"{stem} ({i}){suffix}"
-        if not candidate.exists() and candidate not in reserved:
+        if (not candidate.exists() and not candidate.is_symlink()
+                and candidate.resolve() not in reserved):
             return candidate
     raise RuntimeError(f"Could not find a unique name for {path}")

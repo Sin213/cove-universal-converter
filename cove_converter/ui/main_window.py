@@ -71,7 +71,7 @@ from cove_converter.routing import (
 )
 from cove_converter.settings import ConversionSettings, load_settings
 from cove_converter.ui.drop_zone import DropZone
-from cove_converter.ui.file_row import FileRow, unique_path
+from cove_converter.ui.file_row import ConversionJob, FileRow, unique_path
 from cove_converter.ui.formats_dialog import FormatsDialog
 from cove_converter.ui.quality_dialog import QualityDialog
 from cove_converter.ui.theme import (
@@ -1315,6 +1315,7 @@ class MainWindow(QMainWindow):
         self._batch_skipped = 0
         self._batch_total = 0
         self.status_msg.setText("")
+        self.convert_btn.setEnabled(True)
         self.open_file_btn.setVisible(False)
         self.show_folder_btn.setVisible(False)
         self._update_empty_state()
@@ -1507,6 +1508,72 @@ class MainWindow(QMainWindow):
     # Conversion / queue
     # =========================================================
 
+    def _prepare_jobs(
+        self, resolved: list[tuple[FileRow, Path]]
+    ) -> list[FileRow] | None:
+        """Reserve destinations before asking about existing files.
+
+        Jobs never share a destination or replace another queued input, even
+        when the user elects to overwrite existing outputs. Renaming also
+        avoids natural destinations belonging to later rows in this batch.
+        """
+        reserved = {r.path.resolve() for r in self._rows}
+        for r in (*self._pending_rows, *self._active_rows):
+            if r.job is not None:
+                reserved.add(r.job.output_path.resolve())
+        for worker in self._dead_workers:
+            reserved.add(worker.input_path.resolve())
+            reserved.add(worker._final_output_path.resolve())
+        natural = {out.resolve() for _, out in resolved}
+        planned: list[tuple[FileRow, Path]] = []
+        for row, out in resolved:
+            try:
+                if out.resolve() in reserved:
+                    out = unique_path(out, reserved | natural)
+            except RuntimeError as exc:
+                self._record_preflight_failure(
+                    self._rows.index(row), "Failed: no free output name", str(exc)
+                )
+                continue
+            reserved.add(out.resolve())
+            planned.append((row, out))
+
+        conflicts = [(row, out) for row, out in planned
+                     if out.exists() or out.is_symlink()]
+        choice = self._ask_overwrite(conflicts) if conflicts else "overwrite"
+        if choice == "cancel":
+            return None
+
+        ready: list[FileRow] = []
+        for row, out in planned:
+            if choice == "rename" and (out.exists() or out.is_symlink()):
+                try:
+                    out = unique_path(out, reserved | natural)
+                except RuntimeError as exc:
+                    self._record_preflight_failure(
+                        self._rows.index(row), "Failed: no free output name", str(exc)
+                    )
+                    continue
+                reserved.add(out.resolve())
+            engine = engine_for(effective_suffix(row.path), row.target_ext)
+            assert engine is not None  # callers validated the route
+            row.override_output = out
+            # Resolve only the parent directory of each path so a later-
+            # retargeted parent symlink can't move where the worker reads or
+            # writes (the original collision-safety gap), while the leaf
+            # filename stays literal so an existing leaf symlink's suffix and
+            # overwrite semantics are preserved for the worker - matching
+            # unique_path()'s convention of comparing resolved paths but
+            # returning/using literal ones.
+            frozen_input = row.path.parent.resolve() / row.path.name
+            frozen_output = out.parent.resolve() / out.name
+            row.job = ConversionJob(
+                frozen_input, frozen_output, row.target_ext, engine,
+                replace(self._settings, enhance_scanned_pdf=row.enhance_pdf),
+            )
+            ready.append(row)
+        return ready
+
     def _convert_all(self) -> None:
         eligible: list[FileRow] = []
         resolved: list[tuple[FileRow, Path]] = []
@@ -1557,32 +1624,13 @@ class MainWindow(QMainWindow):
             self._toast.show_message("Nothing to convert")
             return
 
-        conflicts = [(r, out) for r, out in resolved if out.exists()]
-        if conflicts:
-            choice = self._ask_overwrite(conflicts)
-            if choice == "cancel":
-                return
-            if choice == "rename":
-                reserved: set[Path] = set()
-                for r, out in conflicts:
-                    try:
-                        candidate = unique_path(out, reserved)
-                    except RuntimeError as exc:
-                        # 1000 numbered variants exhausted - fail this row
-                        # instead of blowing up the whole click handler.
-                        try:
-                            idx = self._rows.index(r)
-                        except ValueError:
-                            continue
-                        self._record_preflight_failure(
-                            idx, "Failed: no free output name", str(exc),
-                        )
-                        if r in eligible:
-                            eligible.remove(r)
-                        pre_failed += 1
-                        continue
-                    r.override_output = candidate
-                    reserved.add(candidate)
+        prepared = self._prepare_jobs(resolved)
+        if prepared is None:
+            return
+        pre_failed += len(eligible) - len(prepared)
+        eligible = prepared
+        if not eligible:
+            return
 
         self.convert_btn.setEnabled(False)
         self.open_file_btn.setVisible(False)
@@ -1618,6 +1666,8 @@ class MainWindow(QMainWindow):
             return
         if row.status in ("Queued", "Processing", "Done"):
             return
+        if row in self._pending_rows or row in self._active_rows:
+            return
 
         # A retry/start hits this path; drop any prior worker traceback
         # *before* preflight so a stale log can't survive a new attempt.
@@ -1644,20 +1694,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if out.exists():
-            choice = self._ask_overwrite([(row, out)])
-            if choice == "cancel":
-                return
-            if choice == "rename":
-                try:
-                    row.override_output = unique_path(out)
-                except RuntimeError as exc:
-                    self._record_preflight_failure(
-                        index, "Failed: no free output name", str(exc),
-                    )
-                    return
-
-        if row in self._pending_rows or row in self._active_rows:
+        if not self._prepare_jobs([(row, out)]):
             return
 
         self._pending_rows.append(row)
@@ -1714,29 +1751,27 @@ class MainWindow(QMainWindow):
         # and the worker-creation path that follows.
         row.error_log = None
         row.completed_output = None
-        engine = engine_for(effective_suffix(row.path), row.target_ext)
-        if engine is None:
+        job = row.job
+        if job is None:
             self._record_preflight_failure(
                 index,
                 "Unsupported",
-                f"Unsupported: no engine available to convert "
-                f"{effective_suffix(row.path)} → {row.target_ext}",
+                "Unsupported: conversion job was not prepared",
             )
+            # This row never reaches _on_worker_finished (no worker was
+            # created), so its outcome must be folded into the batch
+            # counters here or the summary silently undercounts the total.
+            self._batch_skipped += 1
             return
 
-        output_path = row.resolve_output(self._output_dir)
         self._append_log(
             "info",
             f"Started {row.path.name}",
-            f"{effective_suffix(row.path)} -> {row.target_ext}",
+            f"{effective_suffix(job.input_path)} -> {job.target_ext}",
         )
 
-        worker_cls = worker_for(engine)
-        # Merge the per-row Enhance-PDF flag into a per-call settings copy
-        # so the global ``self._settings`` stays the source of every other
-        # quality knob.
-        row_settings = replace(self._settings, enhance_scanned_pdf=row.enhance_pdf)
-        worker = worker_cls(row.path, output_path, row_settings)
+        worker_cls = worker_for(job.engine)
+        worker = worker_cls(job.input_path, job.output_path, replace(job.settings))
         row.worker = worker
 
         # Capture the row, not its index — Clear Failed during an in-flight
@@ -1811,7 +1846,9 @@ class MainWindow(QMainWindow):
                 if row.completed_output is None:
                     # Fallback only - finished_ok normally recorded the
                     # real path already.
-                    row.completed_output = row.resolve_output(self._output_dir)
+                    row.completed_output = (
+                        row.job.output_path if row.job else row.resolve_output(self._output_dir)
+                    )
                 # A successful conversion supersedes any prior failure;
                 # don't let a stale log linger on a now-Done row.
                 row.error_log = None
@@ -1968,6 +2005,10 @@ class MainWindow(QMainWindow):
         if not (0 <= index < len(self._row_widgets)):
             return
         cells = self._row_widgets[index]
+        for name in ("target", "enhance_pdf"):
+            widget = cells.get(name)
+            if widget is not None:
+                widget.setEnabled(text not in ("Queued", "Processing"))
         if text == "Done":
             cells["status"].set_state("done")
             cells["progress"].set_progress(100, state="done")
