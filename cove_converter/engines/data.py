@@ -12,9 +12,12 @@ import datetime as _dt
 import json
 import math
 import plistlib
+import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
 from cove_converter.engines.base import BaseConverterWorker
+from cove_converter.engines.text_io import open_text
 
 
 def _read_text(path: Path) -> str:
@@ -204,27 +207,28 @@ def _build_collision_loader():
         yield data
         merged_pairs = node.value[: len(node.value) - explicit_count]
         explicit_pairs = node.value[len(node.value) - explicit_count:]
-        seen_python: list = []
+        seen_python: set = set()
         seen_json: dict[str, object] = {}
         for key_node, _value_node in explicit_pairs:
             key = loader.construct_object(key_node, deep=True)
-            for prev in seen_python:
-                try:
-                    same = prev == key
-                except Exception:
-                    same = False
-                if same:
-                    raise YamlKeyCollisionError(
-                        f"YAML mapping has duplicate/equivalent keys: "
-                        f"{prev!r} and {key!r}"
-                    )
+            try:
+                duplicate = key in seen_python
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    "found unhashable key", key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise YamlKeyCollisionError(
+                    f"YAML mapping has duplicate/equivalent key: {key!r}"
+                )
             jk = _json_key(key)
             if jk in seen_json:
                 raise YamlKeyCollisionError(
                     f"YAML keys {seen_json[jk]!r} and {key!r} both map to "
                     f"JSON key {jk!r}; refusing to silently drop one value"
                 )
-            seen_python.append(key)
+            seen_python.add(key)
             seen_json[jk] = key
         # Merged pairs first, then explicit pairs override unconditionally.
         # ``flatten_mapping`` already ordered the merged pairs so that plain
@@ -250,29 +254,54 @@ def _yaml_to_json(input_path: Path, output_path: Path) -> None:
 
 def _load_yaml(input_path: Path):
     loader_cls = _build_collision_loader()
-    loader = loader_cls(_read_text(input_path))
-    try:
-        return _json_safe(loader.get_single_data())
-    finally:
-        loader.dispose()
+    with open_text(input_path) as source:
+        loader = loader_cls(source)
+        try:
+            return _json_safe(loader.get_single_data())
+        finally:
+            loader.dispose()
 
 
 def _load_ndjson(input_path: Path) -> list[object]:
-    records: list[object] = []
-    for line_number, line in enumerate(_read_text(input_path).splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            records.append(_json_loads_no_duplicate_keys(line))
-        except (
-            json.JSONDecodeError,
-            JsonDuplicateKeyError,
-            JsonNonFiniteNumberError,
-        ) as exc:
-            raise NdjsonSyntaxError(
-                f"Invalid NDJSON record on line {line_number}: {exc}"
-            ) from exc
-    return records
+    return list(_iter_ndjson(input_path))
+
+
+def _iter_ndjson(input_path: Path) -> Iterator[object]:
+    with open_text(input_path) as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            try:
+                yield _json_loads_no_duplicate_keys(line)
+            except (
+                json.JSONDecodeError,
+                JsonDuplicateKeyError,
+                JsonNonFiniteNumberError,
+            ) as exc:
+                raise NdjsonSyntaxError(
+                    f"Invalid NDJSON record on line {line_number}: {exc}"
+                ) from exc
+
+
+def _write_records(records, output_path: Path, ext: str, *, cancelled=None) -> None:
+    """Stream records to NDJSON or a JSON array without retaining the batch."""
+    with output_path.open("w", encoding="utf-8") as output:
+        array = ext == ".json"
+        if array:
+            output.write("[")
+        first = True
+        for record in records:
+            if cancelled and cancelled():
+                return  # BaseConverterWorker removes the cancelled temp output
+            if array:
+                output.write("\n" if first else ",\n")
+            json.dump(record, output, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":"))
+            if not array:
+                output.write("\n")
+            first = False
+        if array:
+            output.write("\n]\n" if not first else "]\n")
 
 
 def _plist_json_safe(value, *, path: str = "$"):
@@ -322,16 +351,16 @@ def _load_data(input_path: Path, ext: str):
     if ext in (".ndjson", ".jsonl"):
         return _load_ndjson(input_path)
     if ext == ".plist":
-        return _plist_json_safe(plistlib.loads(input_path.read_bytes()))
+        with input_path.open("rb") as source:
+            return _plist_json_safe(plistlib.load(source))
     raise RuntimeError(f"Unsupported data input format {ext}")
 
 
 def _write_data(data, output_path: Path, ext: str) -> None:
     if ext == ".json":
-        output_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
+        with output_path.open("w", encoding="utf-8") as output:
+            json.dump(data, output, ensure_ascii=False, indent=2, allow_nan=False)
+            output.write("\n")
         return
     if ext in (".yaml", ".yml"):
         import yaml  # type: ignore[import-untyped]
@@ -350,30 +379,18 @@ def _write_data(data, output_path: Path, ext: str) -> None:
             raise NdjsonTopLevelError(
                 "NDJSON output requires a top-level array of records"
             )
-        lines = [
-            json.dumps(
-                record,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-            for record in data
-        ]
-        output_path.write_text(
-            "\n".join(lines) + ("\n" if lines else ""),
-            encoding="utf-8",
-        )
+        _write_records(iter(data), output_path, ext)
         return
     if ext == ".plist":
         safe_data = _plist_json_safe(data)
         try:
-            output_path.write_bytes(
-                plistlib.dumps(
+            with output_path.open("wb") as output:
+                plistlib.dump(
                     safe_data,
+                    output,
                     fmt=plistlib.FMT_XML,
                     sort_keys=False,
                 )
-            )
         except (OverflowError, TypeError, ValueError) as exc:
             raise PlistUnsupportedValueError(
                 f"Value cannot be represented as a property list: {exc}"
@@ -393,9 +410,15 @@ class DataWorker(BaseConverterWorker):
         out_ext = self.output_path.suffix.lower()
         self.progress.emit(20)
 
-        if in_ext in (".yaml", ".yml") and out_ext in (".yaml", ".yml"):
+        if in_ext in (".ndjson", ".jsonl") and out_ext in (".ndjson", ".jsonl", ".json"):
+            _write_records(_iter_ndjson(self.input_path), self.output_path, out_ext,
+                           cancelled=lambda: self._cancel)
+        elif in_ext in (".yaml", ".yml") and out_ext in (".yaml", ".yml"):
             # Reformatting between .yaml and .yml is a no-op other than ext.
-            self.output_path.write_text(_read_text(self.input_path), encoding="utf-8")
+            with open_text(self.input_path) as source, self.output_path.open(
+                "w", encoding="utf-8", newline=""
+            ) as output:
+                shutil.copyfileobj(source, output, length=64 * 1024)
         elif in_ext in _DATA_EXTENSIONS and out_ext in _DATA_EXTENSIONS:
             _write_data(
                 _load_data(self.input_path, in_ext),

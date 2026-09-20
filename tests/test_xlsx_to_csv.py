@@ -322,13 +322,15 @@ class SpreadsheetInputHardening(unittest.TestCase):
             csv.field_size_limit(previous)
 
     def test_concurrent_csv_conversions_serialize_field_limit_changes(self) -> None:
-        from cove_converter.engines.spreadsheets import _read_csv_text as read_csv
+        from contextlib import contextmanager
+        from cove_converter.engines.spreadsheets import open_text
 
         active = 0
         active_lock = threading.Lock()
         overlap = threading.Event()
 
-        def tracked_read(path: Path) -> str:
+        @contextmanager
+        def tracked_read(path: Path, **kwargs):
             nonlocal active
             with active_lock:
                 active += 1
@@ -336,7 +338,8 @@ class SpreadsheetInputHardening(unittest.TestCase):
                     overlap.set()
             try:
                 overlap.wait(timeout=0.2)
-                return read_csv(path)
+                with open_text(path, **kwargs) as source:
+                    yield source
             finally:
                 with active_lock:
                     active -= 1
@@ -346,11 +349,11 @@ class SpreadsheetInputHardening(unittest.TestCase):
             inputs = [root / f"in-{index}.csv" for index in range(2)]
             outputs = [root / f"out-{index}.xlsx" for index in range(2)]
             for path in inputs:
-                path.write_text("value\n" + ("x" * 200_000) + "\n", encoding="utf-8")
+                path.write_text("value\n" + ("x" * 32_767) + "\n", encoding="utf-8")
 
             with (
                 patch(
-                    "cove_converter.engines.spreadsheets._read_csv_text",
+                    "cove_converter.engines.spreadsheets.open_text",
                     new=tracked_read,
                 ),
                 ThreadPoolExecutor(max_workers=2) as executor,

@@ -11,13 +11,13 @@ plain-data round-trip, not a faithful workbook clone)."""
 from __future__ import annotations
 
 import csv
-import io
 import re
 import sys
 import threading
 from pathlib import Path
 
 from cove_converter.engines.base import BaseConverterWorker
+from cove_converter.engines.text_io import open_text
 
 # Excel forbids these characters and XML cannot represent C0 controls.
 _INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\\x00-\x1f]")
@@ -28,6 +28,13 @@ _INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\\x00-\x1f]")
 _FORMULA_TRIGGERS = ("=", "+", "-", "@")
 _FORMULA_LEADING_WHITESPACE = "\t\r\n\f\v"
 _CSV_FIELD_SIZE_LOCK = threading.Lock()
+MAX_XLSX_CELL_CHARACTERS = 32_767
+MAX_XLSX_ROWS = 1_048_576
+MAX_XLSX_COLUMNS = 16_384
+
+
+class SpreadsheetLimitError(ValueError):
+    """The input cannot fit in XLSX without dropping data."""
 
 
 def _sanitize_sheet_title(stem: str) -> str:
@@ -42,20 +49,9 @@ def _sanitize_sheet_title(stem: str) -> str:
 
 
 def _read_csv_text(path: Path) -> str:
-    # CSVs in the wild are frequently not UTF-8 (Excel's default export on
-    # Western Windows is CP1252). Same fallback chain as the subtitle engine;
-    # latin-1 is the never-fails last resort.
-    raw = path.read_bytes()
-    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
-        return raw.decode("utf-32")
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16")
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    # Compatibility helper for callers that explicitly need a string.
+    with open_text(path, legacy_fallback=True) as source:
+        return source.read()
 
 
 def _csv_to_xlsx(
@@ -65,10 +61,10 @@ def _csv_to_xlsx(
     delimiter: str = ",",
 ) -> None:
     from openpyxl import Workbook  # type: ignore[import-untyped]
+    from openpyxl.cell import WriteOnlyCell
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = _sanitize_sheet_title(input_path.stem)
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(_sanitize_sheet_title(input_path.stem))
 
     try:
         # field_size_limit is process-global, so serialize readers while it is
@@ -87,23 +83,51 @@ def _csv_to_xlsx(
                         break
                     except OverflowError:
                         limit //= 2
-                with io.StringIO(_read_csv_text(input_path), newline="") as f:
+                with open_text(input_path, legacy_fallback=True) as f:
                     reader = csv.reader(f, delimiter=delimiter)
                     for row_idx, row in enumerate(reader, start=1):
-                        for col_idx, value in enumerate(row, start=1):
-                            cell = ws.cell(
-                                row=row_idx, column=col_idx, value=value
+                        if row_idx > MAX_XLSX_ROWS:
+                            raise SpreadsheetLimitError(
+                                f"Row {row_idx} exceeds the XLSX row limit ({MAX_XLSX_ROWS})"
                             )
+                        if len(row) > MAX_XLSX_COLUMNS:
+                            raise SpreadsheetLimitError(
+                                f"Row {row_idx}, column {MAX_XLSX_COLUMNS + 1} "
+                                f"exceeds the XLSX column limit ({MAX_XLSX_COLUMNS})"
+                            )
+                        cells = []
+                        for col_idx, value in enumerate(row, start=1):
+                            if len(value) > MAX_XLSX_CELL_CHARACTERS:
+                                raise SpreadsheetLimitError(
+                                    f"Row {row_idx}, column {col_idx} has {len(value)} "
+                                    f"characters; XLSX allows {MAX_XLSX_CELL_CHARACTERS} per cell"
+                                )
+                            cell = WriteOnlyCell(ws, value=value)
                             # CSV gives us only strings. Pin formula-like
                             # values to text so spreadsheet apps cannot execute
                             # them.
                             if _is_formula_like(value):
                                 cell.data_type = "s"
+                            cells.append(cell)
+                        ws.append(cells)
             finally:
                 csv.field_size_limit(previous_limit)
         wb.save(str(output_path))
     finally:
-        wb.close()
+        # Write-only sheets own a temporary XML file, including on failure.
+        # Each step is nested in its own finally so a failure in an earlier
+        # step (e.g. ws.close() hitting a full disk) can't skip the writer
+        # cleanup or wb.close() and leak the temporary XML.
+        try:
+            if not ws.closed:
+                ws.close()
+        finally:
+            try:
+                writer = ws._writer
+                if writer is not None and Path(writer.out).exists():
+                    writer.cleanup()
+            finally:
+                wb.close()
 
 
 def _is_formula_like(value) -> bool:
@@ -190,7 +214,7 @@ def _delimited_to_delimited(
                     break
                 except OverflowError:
                     limit //= 2
-            with io.StringIO(_read_csv_text(input_path), newline="") as source:
+            with open_text(input_path, legacy_fallback=True) as source:
                 reader = csv.reader(source, delimiter=input_delimiter)
                 with output_path.open("w", encoding="utf-8-sig", newline="") as output:
                     writer = csv.writer(output, delimiter=output_delimiter)
