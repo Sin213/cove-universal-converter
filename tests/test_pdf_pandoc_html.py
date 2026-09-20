@@ -27,7 +27,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from cove_converter.engines import pdf as pdf_engine
-from cove_converter.engines.pdf import _pandoc_to_html, _strip_inline_css
+from cove_converter.engines.pdf import (
+    _html_to_pdf,
+    _local_resource_callback,
+    _pandoc_to_html,
+    _strip_inline_css,
+)
 
 
 # ---- _strip_inline_css ------------------------------------------------------
@@ -107,6 +112,73 @@ def test_pandoc_to_html_returns_string_on_success(monkeypatch: pytest.MonkeyPatc
     out = _pandoc_to_html(Path("/nonexistent/sample.epub"))
     assert isinstance(out, str)
     assert "hi" in out
+
+
+def test_pandoc_uses_input_directory_as_resource_path(monkeypatch, tmp_path) -> None:
+    _mock_resolve(monkeypatch)
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        captured["cmd"] = list(cmd)
+        return _fake_completed("<html><body>ok</body></html>")
+
+    monkeypatch.setattr(pdf_engine.subprocess, "run", fake_run)
+    source = tmp_path / "documents" / "input.md"
+    _pandoc_to_html(source)
+    assert f"--resource-path={source.parent.resolve()}" in captured["cmd"]
+
+
+def test_html_to_pdf_embeds_relative_sibling_image(tmp_path) -> None:
+    from PIL import Image
+    from pypdf import PdfReader
+
+    source = tmp_path / "page.html"
+    image = tmp_path / "sibling.png"
+    output = tmp_path / "out.pdf"
+    Image.new("RGB", (80, 60), (220, 20, 20)).save(image)
+    html_source = "<html><body><img src='sibling.png' /></body></html>"
+
+    _html_to_pdf(html_source, output, source_path=source)
+
+    resources = PdfReader(str(output)).pages[0]["/Resources"]
+    assert resources.get("/XObject"), "relative sibling image was omitted"
+
+
+def test_html_resource_callback_reports_remote_and_missing_resources(tmp_path) -> None:
+    source = tmp_path / "safe" / "page.html"
+    callback = _local_resource_callback(source)
+
+    with pytest.raises(RuntimeError, match="offline"):
+        callback("https://example.test/tracker.png", "")
+    with pytest.raises(RuntimeError, match="Missing local resource"):
+        callback("missing.png", "")
+
+
+def test_html_resource_callback_rejects_percent_encoded_unc_path(tmp_path) -> None:
+    """A percent-encoded UNC path has no literal backslash for the raw
+    remote-resource check to catch, but decodes to a real network path
+    (absolute on Windows) - reject it as remote after decoding too."""
+    source = tmp_path / "page.html"
+    callback = _local_resource_callback(source)
+
+    with pytest.raises(RuntimeError, match="offline"):
+        callback("%5c%5cserver%5cshare%5cimage.png", "")
+
+
+def test_html_conversion_fails_on_missing_image(tmp_path) -> None:
+    with pytest.raises(RuntimeError, match="Missing local resource"):
+        _html_to_pdf('<img src="missing.png">', tmp_path / "out.pdf",
+                     source_path=tmp_path / "in.html")
+
+
+def test_html_resources_resolve_against_stylesheet_directory(tmp_path) -> None:
+    css_dir = tmp_path / "styles"
+    css_dir.mkdir()
+    image = css_dir / "texture.png"
+    image.write_bytes(b"resource")
+    callback = _local_resource_callback(tmp_path / "in.html")
+    assert callback("texture.png", str(css_dir)) == str(image)
+    assert callback(image.as_uri(), "") == str(image)
 
 
 # ---- generated-EPUB smoke ---------------------------------------------------

@@ -288,7 +288,7 @@ def test_enhance_does_not_instantiate_pdfreader(scanned_pdf, tmp_path, monkeypat
     monkeypatch.setattr(pypdf.PdfReader, "__init__", _track)
 
     out = tmp_path / "out.pdf"
-    _run_worker_direct(scanned_pdf, out, enhance=True)
+    _enhance_scanned_pdf(scanned_pdf, out, dpi=150)
 
     assert instances == [], (
         f"_enhance_scanned_pdf must not create any PdfReader objects "

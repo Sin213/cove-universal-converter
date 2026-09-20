@@ -17,6 +17,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
 import zipfile
 from pathlib import Path
 from typing import Callable
@@ -25,6 +27,7 @@ from cove_converter.binaries import PANDOC, resolve
 from cove_converter.engines.archives import _extract_to
 from cove_converter.engines.base import BaseConverterWorker
 from cove_converter.engines.pdf_flatten import flatten_pdf, has_pdf_javascript
+from cove_converter.engines.pdfium_runtime import PDFIUM_LOCK
 
 
 # ---- Scanned-PDF enhancement -----------------------------------------------
@@ -152,6 +155,22 @@ def _enhance_scanned_pdf(
     if src.resolve() == dst.resolve():
         raise RuntimeError("Refusing to enhance PDF in place")
 
+    with PDFIUM_LOCK:
+        _enhance_scanned_pdf_locked(
+            src, dst, dpi=dpi, progress=progress, cancelled=cancelled,
+        )
+
+
+def _enhance_scanned_pdf_locked(
+    src: Path,
+    dst: Path,
+    *,
+    dpi: int,
+    progress: Callable[[int], None] | None,
+    cancelled: Callable[[], bool] | None,
+) -> None:
+    """Implementation with the process-wide PDFium lock already held."""
+
     import pypdfium2 as pdfium  # type: ignore[import-untyped]
 
     if progress:
@@ -168,7 +187,11 @@ def _enhance_scanned_pdf(
         raise RuntimeError(f"Could not open PDF: {exc}") from exc
 
     _init_forms_quietly(pdf)
-    n = len(pdf)
+    try:
+        n = len(pdf)
+    except Exception as exc:
+        pdf.close()
+        raise RuntimeError(f"Could not read PDF page count: {exc}") from exc
     if n == 0:
         pdf.close()
         raise RuntimeError("PDF contains no pages")
@@ -426,6 +449,7 @@ def _pandoc_to_html(input_path: Path) -> str:
         "-t", "html5",
         "--standalone",
         "--embed-resources",
+        f"--resource-path={input_path.resolve().parent}",
         "-o", "-",
     ]
     try:
@@ -450,11 +474,76 @@ def _pandoc_to_html(input_path: Path) -> str:
     return stdout
 
 
-def _html_to_pdf(html_source: str, output_path: Path) -> None:
+def _local_resource_callback(source_path: Path, errors: list[str] | None = None):
+    """Resolve local HTML/CSS resources and report loss instead of hiding it."""
+    source_dir = source_path.resolve().parent
+
+    def fail(message: str):
+        if errors is not None:
+            errors.append(message)
+        raise RuntimeError(message)
+
+    def resolve_resource(uri, basepath):  # type: ignore[no-untyped-def]
+        if not uri:
+            return None
+        uri_text = str(uri)
+        parsed = urlsplit(uri_text)
+        if parsed.scheme == "data" or uri_text.startswith("#"):
+            return None
+        # Native Windows drive paths are local despite urlsplit's "c" scheme.
+        native_absolute = Path(uri_text).is_absolute() and not uri_text.startswith("//")
+        if ((parsed.scheme not in ("", "file") and not native_absolute)
+                or parsed.netloc or uri_text.startswith("\\\\")):
+            return fail(f"Remote resource is unavailable in offline conversion: {uri_text}")
+
+        raw_path = (url2pathname(parsed.path) if parsed.scheme == "file" else
+                    unquote(uri_text if native_absolute else parsed.path))
+        # A percent-encoded UNC path (``%5c%5cserver%5cshare%5c...``) has no
+        # literal ``\\`` or ``//`` for the checks above to catch before this
+        # point, but is a real network path once decoded, and a real Windows
+        # deployment resolves it as absolute. Reject after decoding too.
+        if raw_path.replace("/", "\\").startswith("\\\\"):
+            return fail(f"Remote resource is unavailable in offline conversion: {uri_text}")
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            base_dir = source_dir
+            if basepath:
+                base = Path(str(basepath))
+                if base.is_absolute():
+                    base_dir = base if base.is_dir() else base.parent
+            candidate = base_dir / candidate
+        try:
+            resolved = candidate.resolve()
+            if not resolved.is_file():
+                return fail(f"Missing local resource: {resolved}")
+        except (OSError, ValueError) as exc:
+            return fail(f"Could not resolve local resource {uri_text}: {exc}")
+        return str(resolved)
+
+    return resolve_resource
+
+
+def _html_to_pdf(
+    html_source: str,
+    output_path: Path,
+    *,
+    source_path: Path | None = None,
+) -> None:
     from xhtml2pdf import pisa  # type: ignore[import-untyped]
 
+    source_path = source_path or output_path
+    errors: list[str] = []
     with output_path.open("wb") as f:
-        result = pisa.CreatePDF(src=html_source, dest=f, encoding="utf-8")
+        result = pisa.CreatePDF(
+            src=html_source,
+            dest=f,
+            encoding="utf-8",
+            path=str(source_path.resolve()),
+            link_callback=_local_resource_callback(source_path, errors),
+        )
+    if errors:
+        # CSS import handling can catch callback exceptions internally.
+        raise RuntimeError(errors[0])
     if result.err:
         raise RuntimeError(f"xhtml2pdf reported {result.err} error(s) while rendering PDF")
 
@@ -506,6 +595,21 @@ def _pdf_to_cbz(
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
     """Render every page of ``src`` to PNG and pack them into a CBZ (ZIP) at ``dst``."""
+    with PDFIUM_LOCK:
+        _pdf_to_cbz_locked(
+            src, dst, dpi=dpi, progress=progress, cancelled=cancelled,
+        )
+
+
+def _pdf_to_cbz_locked(
+    src: Path,
+    dst: Path,
+    *,
+    dpi: int,
+    progress: Callable[[int], None] | None,
+    cancelled: Callable[[], bool] | None,
+) -> None:
+    """Implementation with the process-wide PDFium lock already held."""
     import io
 
     import pypdfium2 as pdfium  # type: ignore[import-untyped]
@@ -524,7 +628,11 @@ def _pdf_to_cbz(
         raise RuntimeError(f"Could not open PDF: {exc}") from exc
 
     _init_forms_quietly(pdf)
-    n = len(pdf)
+    try:
+        n = len(pdf)
+    except Exception as exc:
+        pdf.close()
+        raise RuntimeError(f"Could not read PDF page count: {exc}") from exc
     if n == 0:
         pdf.close()
         raise RuntimeError("PDF contains no pages")
@@ -573,7 +681,7 @@ class PdfWorker(BaseConverterWorker):
 
         # "Smart" PDFs — JavaScript-driven content / form filling —
         # render visually wrong (or blank) under our normal byte-copy
-        # path. Detect them by literal byte scan and rasterise every
+        # path. Detect parsed JavaScript actions and rasterise every
         # page into a static multi-page PDF before downstream sees it.
         #
         # Scope is intentionally narrow: only PDF → PDF runs through
@@ -669,7 +777,11 @@ class PdfWorker(BaseConverterWorker):
             else:
                 html_source = _strip_inline_css(_pandoc_to_html(self.input_path))
             self.progress.emit(60)
-            _html_to_pdf(html_source, self.output_path)
+            _html_to_pdf(
+                html_source,
+                self.output_path,
+                source_path=self.input_path,
+            )
             return
 
         raise RuntimeError(f"PdfWorker cannot convert {in_ext} → {out_ext}")

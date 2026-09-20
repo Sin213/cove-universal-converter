@@ -1,8 +1,8 @@
 """Tests for the smart-PDF (JavaScript) flattening path.
 
 Covers:
-  * ``has_pdf_javascript`` detection on raw bytes (positive and negative,
-    streaming over the whole file with chunk-boundary overlap).
+  * ``has_pdf_javascript`` detection on parsed action dictionaries without
+    treating visible ``/JS`` text as executable content.
   * ``flatten_pdf`` rasterises every page via PDFium and rebuilds a
     valid multi-page PDF that preserves page count and page size.
   * Output validation: bad / partial output is removed, never published.
@@ -25,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pypdfium2 as pdfium
 import pytest
 from PIL import Image, ImageDraw
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from cove_converter.engines import pdf as pdf_engine
 from cove_converter.engines.pdf import PdfWorker
@@ -55,15 +57,16 @@ def _synth_plain_pdf(
 
 
 def _synth_js_pdf(path: Path, *, pages: int = 1, **kw) -> None:
-    """Valid PDF with an injected ``/JavaScript`` action so detection trips.
-
-    Built on top of a PIL-rendered base PDF — the bytes between ``%PDF`` and
-    ``%%EOF`` are a real PDF, with the JS marker appended in a comment block.
-    ``has_pdf_javascript`` is a literal byte scan, so a comment is enough.
-    """
+    """Valid PDF with an indirect JavaScript action in its name tree."""
     _synth_plain_pdf(path, pages=pages, **kw)
-    with path.open("ab") as f:
-        f.write(b"\n% /JavaScript /JS injected for routing test\n")
+    reader = PdfReader(str(path))
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    writer.add_js("app.alert('routing test')")
+    replacement = path.with_name(f".{path.name}.with-js")
+    with replacement.open("wb") as f:
+        writer.write(f)
+    replacement.replace(path)
 
 
 # ---- Detection -------------------------------------------------------------
@@ -74,18 +77,18 @@ def test_detect_plain_pdf_returns_false(tmp_path):
     assert has_pdf_javascript(p) is False
 
 
-def test_detect_js_marker_returns_true(tmp_path):
+def test_detect_indirect_js_action_returns_true(tmp_path):
     p = tmp_path / "smart.pdf"
     _synth_js_pdf(p)
     assert has_pdf_javascript(p) is True
 
 
-def test_detect_short_js_token_returns_true(tmp_path):
+def test_detect_js_token_in_comment_returns_false(tmp_path):
     p = tmp_path / "shortjs.pdf"
     _synth_plain_pdf(p)
     with p.open("ab") as f:
         f.write(b"\n% /JS appended\n")
-    assert has_pdf_javascript(p) is True
+    assert has_pdf_javascript(p) is False
 
 
 def test_detect_missing_file_returns_false(tmp_path):
@@ -98,35 +101,440 @@ def test_detect_empty_file_returns_false(tmp_path):
     assert has_pdf_javascript(p) is False
 
 
-def test_detect_marker_in_central_region(tmp_path):
-    """PDF object ordering is not guaranteed; markers can live in the
-    middle of a large PDF. Streaming scan must catch them."""
-    p = tmp_path / "central.pdf"
-    # Trailing space: a PDF name must end at a delimiter; the detector
-    # rejects /JavaScript glued to further regular characters (that would
-    # be a different name, e.g. /JavaScriptFoo).
-    marker = b"/JavaScript "
-    size = 4 * 1024 * 1024
-    pos = size // 2
-    blob = bytearray(b"a" * pos)
-    blob += marker
-    blob += b"b" * (size - pos - len(marker))
-    p.write_bytes(bytes(blob))
-    assert has_pdf_javascript(p) is True
+def test_detect_visible_js_text_returns_false_and_remains_selectable(tmp_path):
+    from reportlab.pdfgen.canvas import Canvas
+
+    p = tmp_path / "visible-js.pdf"
+    # pageCompression=0 keeps the content stream uncompressed so the
+    # literal "/JS " text is actually present as raw bytes in the file.
+    # A compressed stream (reportlab's default) would hide the text from
+    # a naive byte scan regardless of whether that scan is buggy, making
+    # the assertion below pass even against the old raw-byte-scan
+    # detector. An uncompressed stream is required for this test to be
+    # a real oracle for the false-positive regression.
+    canvas = Canvas(str(p), pageCompression=0)
+    canvas.drawString(72, 720, "Use the /JS literal in this sentence")
+    canvas.save()
+
+    assert "/JS literal" in (PdfReader(str(p)).pages[0].extract_text() or "")
+    assert b"/JS " in p.read_bytes(), "test setup must keep /JS visible in raw bytes"
+    assert has_pdf_javascript(p) is False
 
 
-def test_detect_marker_straddling_chunk_boundary_mid_file(tmp_path):
-    """Marker straddling a 1 MiB chunk boundary must still be caught
-    via the carry-over between successive streaming chunks."""
-    p = tmp_path / "mid_straddle.pdf"
-    CHUNK = 1_048_576
-    marker = b"/JavaScript "  # delimiter-terminated PDF name
-    size = 4 * CHUNK + 12345
-    pos = 2 * CHUNK - 5
-    blob = bytearray(b"a" * pos)
-    blob += marker
-    blob += b"b" * (size - pos - len(marker))
-    p.write_bytes(bytes(blob))
+def test_detect_javascript_shaped_metadata_is_not_an_action(tmp_path):
+    """A dict with /S=/JavaScript + /JS reached only through /Info (document
+    metadata) is not reachable through any key a PDF viewer treats as an
+    action, and must not be mistaken for one."""
+    p = tmp_path / "metadata-js.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_metadata({"/S": "/JavaScript", "/JS": "not really an action"})
+    with p.open("wb") as f:
+        writer.write(f)
+
+    assert has_pdf_javascript(p) is False
+
+
+def test_detect_cyclic_next_action_chain_does_not_hang():
+    """An /OpenAction whose /Next chain cycles back to itself must not hang
+    the whole conversion - resolve, don't leave a bare indirect-object
+    identity check, or a self-referencing chain loops forever."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import DictionaryObject, NameObject
+
+    cyclic = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/GoTo"),
+    })
+    cyclic[NameObject("/Next")] = cyclic  # direct self-reference
+
+    root = DictionaryObject({NameObject("/OpenAction"): cyclic})
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = []
+
+    assert _reader_has_javascript(reader) is False
+
+
+def test_detect_javascript_via_name_tree_kids_split_node():
+    """A /Names/JavaScript tree split into /Kids leaf nodes (real documents
+    with many named scripts commonly do this) must still be searched."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import (
+        ArrayObject, DictionaryObject, NameObject, TextStringObject,
+    )
+
+    action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('boot')"),
+    })
+    leaf = DictionaryObject({
+        NameObject("/Names"): ArrayObject([TextStringObject("boot"), action]),
+    })
+    js_tree = DictionaryObject({NameObject("/Kids"): ArrayObject([leaf])})
+    names = DictionaryObject({NameObject("/JavaScript"): js_tree})
+    root = DictionaryObject({NameObject("/Names"): names})
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = []
+
+    assert _reader_has_javascript(reader) is True
+
+
+def test_detect_destination_array_open_action_is_not_confused_with_actions():
+    """/OpenAction is EITHER a destination array (``[page /Fit]``) OR a
+    single action dictionary per spec - never an array of actions. Even
+    with incidental /S and /Next keys on the destination page (as if it
+    were itself a chained action), its elements must never be inspected as
+    actions at all."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import (
+        ArrayObject, DictionaryObject, NameObject, TextStringObject,
+    )
+
+    js_shaped = DictionaryObject({
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("not really chained"),
+    })
+    page = DictionaryObject({NameObject("/Type"): NameObject("/Page")})
+    page[NameObject("/S")] = NameObject("/GoTo")  # incidental, not a real action
+    page[NameObject("/Next")] = js_shaped
+
+    root = DictionaryObject({
+        NameObject("/OpenAction"): ArrayObject([page, NameObject("/Fit")]),
+    })
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = []
+
+    assert _reader_has_javascript(reader) is False
+
+
+def test_detect_javascript_on_outline_bookmark_action():
+    """An outline (bookmark) item's own /A action fires when the bookmark
+    is clicked and must be detected, including when reached via a sibling
+    chain (/First then /Next), not just page/annotation/field positions."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('bookmark')"),
+    })
+    first_item = DictionaryObject({NameObject("/Title"): TextStringObject("Ch 1")})
+    second_item = DictionaryObject({
+        NameObject("/Title"): TextStringObject("Ch 2"),
+        NameObject("/A"): js_action,
+    })
+    first_item[NameObject("/Next")] = second_item
+
+    outlines = DictionaryObject({NameObject("/First"): first_item})
+    root = DictionaryObject({NameObject("/Outlines"): outlines})
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = []
+
+    assert _reader_has_javascript(reader) is True
+
+
+def test_detect_unknown_additional_action_key_is_not_an_action():
+    """A page /AA dict only defines /O (open) and /C (close) trigger
+    events per spec - an unrelated key stashed in the same dict must not
+    be treated as a trigger just because it lives inside /AA."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    js_shaped = DictionaryObject({
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("not a real page trigger"),
+    })
+    page = DictionaryObject({
+        NameObject("/Type"): NameObject("/Page"),
+        NameObject("/AA"): DictionaryObject({NameObject("/CustomData"): js_shaped}),
+    })
+    root = DictionaryObject()
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = [page]
+
+    assert _reader_has_javascript(reader) is False
+
+
+def test_detect_goto_action_with_inert_js_key_is_not_executable():
+    """/GoTo defines its own subtype-specific keys (/D, a destination); an
+    incidental /JS entry alongside it is inert data per the subtype's own
+    definition, not a script, and must not force flattening."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import (
+        ArrayObject, DictionaryObject, NameObject, NumberObject,
+        TextStringObject,
+    )
+
+    goto_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/GoTo"),
+        NameObject("/D"): ArrayObject([NumberObject(0), NameObject("/Fit")]),
+        NameObject("/JS"): TextStringObject("unused data"),
+    })
+    root = DictionaryObject({NameObject("/OpenAction"): goto_action})
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = []
+
+    assert _reader_has_javascript(reader) is False
+
+
+def test_detect_javascript_on_rendition_action():
+    """A rendition action (/S /Rendition, used for embedded video/audio
+    playback control) can carry its own executable /JS script per ISO
+    32000-1 Section 12.6.4.13 - not just /S /JavaScript actions."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    rendition_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/Rendition"),
+        NameObject("/JS"): TextStringObject("app.alert('rendition script')"),
+    })
+    root = DictionaryObject({NameObject("/OpenAction"): rendition_action})
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = []
+
+    assert _reader_has_javascript(reader) is True
+
+
+def test_detect_javascript_on_merged_widget_field_annotation():
+    """A single indirect Widget-annotation dictionary is commonly both a
+    page annotation (in /Annots) AND a form field (in /AcroForm/Fields) -
+    its field-role /AA (/K, /F, /V, /C) must still be checked even though
+    the same object was already visited in its annotation role."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import (
+        ArrayObject, DictionaryObject, NameObject, TextStringObject,
+    )
+
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('field validate')"),
+    })
+    merged = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/Widget"),
+        NameObject("/FT"): NameObject("/Tx"),
+        NameObject("/AA"): DictionaryObject({NameObject("/K"): js_action}),
+    })
+
+    page = DictionaryObject({
+        NameObject("/Type"): NameObject("/Page"),
+        NameObject("/Annots"): ArrayObject([merged]),
+    })
+    acroform = DictionaryObject({NameObject("/Fields"): ArrayObject([merged])})
+    root = DictionaryObject({NameObject("/AcroForm"): acroform})
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = [page]
+
+    assert _reader_has_javascript(reader) is True
+
+
+def test_detect_javascript_on_annotation_page_visibility_event():
+    """/AA /PV (page-becomes-visible) is a standard annotation additional
+    action event, not just /E /X /D /U /Fo /Bl."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import (
+        ArrayObject, DictionaryObject, NameObject, TextStringObject,
+    )
+
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('page visible')"),
+    })
+    annot = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/Widget"),
+        NameObject("/AA"): DictionaryObject({NameObject("/PV"): js_action}),
+    })
+    page = DictionaryObject({
+        NameObject("/Type"): NameObject("/Page"),
+        NameObject("/Annots"): ArrayObject([annot]),
+    })
+    root = DictionaryObject()
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = [page]
+
+    assert _reader_has_javascript(reader) is True
+
+
+def test_detect_custom_dict_with_action_shaped_key_is_not_an_action():
+    """A key literally named ``/A`` on an arbitrary custom catalog entry is
+    not an annotation/field action just because it shares that key name -
+    only ``/A`` on an actual annotation/field dictionary counts."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    inert = DictionaryObject({
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("not an action"),
+    })
+    custom = DictionaryObject({NameObject("/A"): inert})
+
+    root = DictionaryObject({NameObject("/CustomData"): custom})
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = []
+
+    assert _reader_has_javascript(reader) is False
+
+
+def test_detect_open_action_found_even_after_unrelated_reference_to_same_object():
+    """The same indirect action object reachable both through an unrelated
+    custom key (not an action position) and through the real /OpenAction
+    must still be detected via /OpenAction - visiting it once via the inert
+    path must not suppress checking it via the real one."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('real')"),
+    })
+
+    root = DictionaryObject({
+        NameObject("/CustomData"): action,
+        NameObject("/OpenAction"): action,
+    })
+    trailer = DictionaryObject({NameObject("/Root"): root})
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+    reader.pages = []
+
+    assert _reader_has_javascript(reader) is True
+
+
+def test_detect_broken_sibling_action_does_not_hide_real_javascript():
+    """A malformed sibling action (its own ``/S`` value is an indirect
+    reference that raises on resolution) must only drop that one branch of
+    the walk, not silence detection of a real action reached the same way."""
+    from cove_converter.engines.pdf_flatten import _reader_has_javascript
+    from pypdf.generic import (
+        DictionaryObject, IndirectObject, NameObject, TextStringObject,
+    )
+
+    class _BrokenIndirect(IndirectObject):
+        def __init__(self):
+            pass
+
+        def get_object(self):
+            raise ValueError("simulated corruption resolving an indirect value")
+
+    real_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('real')"),
+    })
+    broken_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): _BrokenIndirect(),
+    })
+
+    # Two independent, valid document-level additional-action slots
+    # (/WC, /DS) - one broken, one real - reached via the catalog /AA
+    # dict, not an invalid "array of actions" /OpenAction shape.
+    root = DictionaryObject()
+    root[NameObject("/AA")] = DictionaryObject({
+        NameObject("/WC"): broken_action,
+        NameObject("/DS"): real_action,
+    })
+
+    trailer = DictionaryObject()
+    trailer[NameObject("/Root")] = root
+
+    class _FakeReader:
+        pass
+
+    reader = _FakeReader()
+    reader.trailer = trailer
+
+    assert _reader_has_javascript(reader) is True
+
+
+def test_detect_indirect_compressed_javascript_stream(tmp_path):
+    p = tmp_path / "compressed-js.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    script = DecodedStreamObject()
+    script.set_data(b"app.alert('compressed')")
+    script_ref = writer._add_object(script.flate_encode())
+    action_ref = writer._add_object(DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): script_ref,
+    }))
+    writer.root_object[NameObject("/OpenAction")] = action_ref
+    with p.open("wb") as f:
+        writer.write(f)
+
     assert has_pdf_javascript(p) is True
 
 
@@ -597,6 +1005,68 @@ def test_flatten_failure_in_one_thread_does_not_break_others(tmp_path):
     assert results["good_b"][0] == "ok", (
         f"good PDF must succeed despite a sibling failure: {results['good_b']}"
     )
+
+
+def test_all_pdfium_operations_share_one_native_lifetime_lock(
+    tmp_path, monkeypatch,
+):
+    """Flatten, enhancement, and PDF→CBZ may never overlap in PDFium."""
+    import threading
+    import time
+
+    from cove_converter.engines import pdf_flatten
+
+    active = 0
+    peak = 0
+    guard = threading.Lock()
+
+    def tracked(*_args, **_kwargs):
+        nonlocal active, peak
+        with guard:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.03)
+        with guard:
+            active -= 1
+
+    monkeypatch.setattr(pdf_flatten, "_flatten_pdf_locked", tracked)
+    monkeypatch.setattr(pdf_engine, "_enhance_scanned_pdf_locked", tracked)
+    monkeypatch.setattr(pdf_engine, "_pdf_to_cbz_locked", tracked)
+
+    calls = [
+        lambda: pdf_flatten.flatten_pdf(tmp_path / "a.pdf", tmp_path / "a-out.pdf"),
+        lambda: pdf_engine._enhance_scanned_pdf(
+            tmp_path / "b.pdf", tmp_path / "b-out.pdf",
+        ),
+        lambda: pdf_engine._pdf_to_cbz(
+            tmp_path / "c.pdf", tmp_path / "c-out.cbz",
+        ),
+    ]
+    threads = [threading.Thread(target=call) for call in calls]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert peak == 1
+
+
+def test_flatten_encodes_each_page_once_at_explicit_quality(tmp_path, monkeypatch):
+    src = tmp_path / "in.pdf"
+    dst = tmp_path / "out.pdf"
+    _synth_plain_pdf(src, pages=3)
+
+    real_save = Image.Image.save
+    saves: list[tuple[str | None, int | None]] = []
+
+    def spy(self, fp, format=None, **kwargs):  # type: ignore[no-untyped-def]
+        saves.append((format, kwargs.get("quality")))
+        return real_save(self, fp, format=format, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "save", spy)
+    flatten_pdf(src, dst)
+
+    assert saves == [("PDF", 92), ("PDF", 92), ("PDF", 92)]
 
 
 # ---- Routing through PdfWorker --------------------------------------------

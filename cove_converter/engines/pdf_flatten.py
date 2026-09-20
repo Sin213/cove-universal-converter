@@ -35,12 +35,11 @@ checks (page count mismatch, suspiciously tiny size), we raise
 from __future__ import annotations
 
 import logging
-import re
-import tempfile
-import threading
 import warnings
 from pathlib import Path
 from typing import Callable
+
+from cove_converter.engines.pdfium_runtime import PDFIUM_LOCK
 
 _log = logging.getLogger("cove_converter.pdf_flatten")
 
@@ -56,34 +55,6 @@ _log = logging.getLogger("cove_converter.pdf_flatten")
 # never ran). Serialise the entire flatten so concurrent batch workers
 # can't trip the race. Single-file conversions hit this lock once and
 # pay no contention.
-_PDFIUM_LOCK = threading.Lock()
-
-
-# Markers that the user's spec asks us to detect. ``/JavaScript`` names the
-# action type; ``/JS`` is the key whose value holds the script. The marker
-# must be followed by a PDF delimiter (whitespace or ()<>[]{}/%) — a bare
-# substring scan would false-positive on names like ``/JSON`` or literal
-# text in content streams, rerouting clean PDFs through the destructive
-# rasterising flatten path.
-_JS_MARKER_RE = re.compile(
-    rb"/(?:JavaScript|JS)(?=[\x00\t\n\x0c\r ()<>\[\]{}/%])"
-)
-# Longest marker text, used to size the inter-chunk carry.
-_JS_MARKERS: tuple[bytes, ...] = (b"/JavaScript", b"/JS")
-
-# Bounded-memory streaming scan. PDF object ordering is not guaranteed —
-# JavaScript action dictionaries can live in indirect objects or compressed
-# object streams anywhere in the file, so a head+tail-only scan can miss
-# them on large PDFs. We read the whole file but only ever hold one chunk
-# (plus a tiny carry-over) in memory at a time.
-_DETECT_CHUNK_BYTES = 1_048_576       # 1 MiB
-# Carry-over between chunks so a marker that straddles a chunk boundary
-# still appears whole in the next iteration's scan window. ``len(marker)``
-# (not the usual ``- 1``) because the regex also needs the one delimiter
-# byte *after* the marker to be present in the same window.
-_BOUNDARY_OVERLAP = max(len(m) for m in _JS_MARKERS)
-
-
 # ---- Render parameters -----------------------------------------------------
 
 # Render DPI for each page. 250 DPI keeps fine decorative artwork
@@ -110,48 +81,304 @@ _MIN_BYTES_PER_PAGE = 4 * 1024
 # ---- Detection -------------------------------------------------------------
 
 def has_pdf_javascript(path: Path) -> bool:
-    """Return True if ``path`` looks like a JavaScript-bearing PDF.
+    """Return whether the parsed document contains a JavaScript action.
 
-    Streams the file in ``_DETECT_CHUNK_BYTES`` chunks, carrying
-    ``_BOUNDARY_OVERLAP`` bytes between chunks so a marker straddling a
-    chunk boundary is still seen whole in the next iteration. Bounded
-    memory: at most one chunk plus the small carry-over is resident at
-    any time, regardless of file size. Whole-file coverage is needed
-    because PDF object ordering is not guaranteed — JavaScript action
-    dictionaries can sit in indirect objects or compressed object
-    streams anywhere in the file, not just the catalog at the head/tail.
+    PDF strings and page content are deliberately never searched as raw
+    bytes: visible text such as ``/JS`` must retain its selectable text layer.
+    Walking parsed objects also resolves indirect objects and object streams,
+    so valid compressed/indirect action dictionaries are still detected.
     """
     try:
-        size = path.stat().st_size
+        if path.stat().st_size <= 0:
+            return False
     except OSError:
-        return False
-    if size <= 0:
         return False
 
     try:
-        with path.open("rb") as f:
-            carry = b""
-            while True:
-                chunk = f.read(_DETECT_CHUNK_BYTES)
-                if not chunk:
-                    break
-                window = carry + chunk
-                if _JS_MARKER_RE.search(window):
-                    return True
-                # Keep the trailing ``_BOUNDARY_OVERLAP`` bytes so a marker
-                # split across this chunk's end and the next chunk's start
-                # is fully present in the next iteration's window.
-                if _BOUNDARY_OVERLAP and len(window) > _BOUNDARY_OVERLAP:
-                    carry = window[-_BOUNDARY_OVERLAP:]
-                else:
-                    carry = window
-            # End-of-file counts as a delimiter: a marker that is literally
-            # the last bytes of the file has no following byte for the
-            # regex lookahead to see.
-            if re.search(rb"/(?:JavaScript|JS)\Z", carry):
-                return True
-    except OSError:
+        from pypdf import PdfReader
+        # Passing a filename makes pypdf copy the entire PDF into BytesIO.
+        # Keep a seekable file open while inspecting just the action graph.
+        with path.open("rb") as source:
+            return _reader_has_javascript(PdfReader(source, strict=False))
+    except Exception:  # unreadable/malformed PDFs are handled by conversion
         return False
+
+
+# A dictionary is only something a PDF viewer will ever execute as
+# JavaScript if it sits in one of a small number of *specific structural
+# positions*: the catalog's /OpenAction, a document/page/annotation/field
+# /AA (additional-actions) dict, an annotation or form field's /A, an
+# action's own /Next chain, or the catalog's /Names -> /JavaScript name
+# tree. Matching on bare key names anywhere in the object graph (the
+# previous approach here) is unsound in both directions: a key literally
+# named "/A" or "/Names" can appear on an arbitrary custom dictionary that
+# has nothing to do with actions, and the reachability-tracking needed to
+# avoid that can itself hide a real action if the same object is also
+# reachable through an unrelated path. Walking the known positions
+# explicitly avoids both failure modes.
+def _reader_has_javascript(reader) -> bool:
+    from pypdf.generic import (
+        ArrayObject, ByteStringObject, DictionaryObject, IndirectObject,
+        StreamObject,
+    )
+
+    def resolve(obj):
+        try:
+            if isinstance(obj, IndirectObject):
+                return obj.get_object()
+            return obj
+        except Exception:
+            return None
+
+    # The action subtypes ISO 32000-1 actually defines as carrying an
+    # executable /JS script: the standard /S /JavaScript action, and a
+    # rendition action (/S /Rendition, embedded video/audio playback
+    # control, Section 12.6.4.13). Other action subtypes (/GoTo, /URI,
+    # /Named, ...) each define their own subtype-specific keys (/D, /URI,
+    # /N, ...); an unrelated /JS entry incidentally present alongside one
+    # of those is inert data per the subtype's own definition, not a
+    # script - accepting /JS on ANY action regardless of subtype (a prior
+    # version of this check) treated that inert data as executable and
+    # rasterised ordinary PDFs unnecessarily.
+    _JS_BEARING_ACTION_TYPES = frozenset({"/JavaScript", "/Rendition"})
+
+    def is_js_action(obj) -> bool:
+        try:
+            return (
+                isinstance(obj, DictionaryObject)
+                and "/S" in obj
+                and obj["/S"] in _JS_BEARING_ACTION_TYPES
+                and "/JS" in obj
+                and isinstance(
+                    obj["/JS"], (str, bytes, ByteStringObject, StreamObject)
+                )
+            )
+        except Exception:
+            return False
+
+    # A single action, possibly chained through /Next (a single action or an
+    # array of actions - the one place PDF actually allows an array here).
+    # Every PDF action dictionary requires an /S entry (its type); a
+    # dictionary without one is never treated as an action or followed
+    # further, so an attacker cannot smuggle a JS-shaped descendant into
+    # detection just by attaching an inert key to an unrelated object.
+    def action_has_js(action_ref, seen: set[int]) -> bool:
+        pending = [action_ref]
+        while pending:
+            item = pending.pop()
+            try:
+                item = resolve(item)
+                if isinstance(item, ArrayObject):
+                    if id(item) in seen:
+                        continue
+                    seen.add(id(item))
+                    pending.extend(item)
+                    continue
+                if not isinstance(item, DictionaryObject):
+                    continue
+                if id(item) in seen:
+                    continue
+                seen.add(id(item))
+                if "/S" not in item:
+                    continue
+                if is_js_action(item):
+                    return True
+                if "/Next" in item:
+                    pending.append(item["/Next"])
+            except Exception:
+                continue
+        return False
+
+    # /OpenAction is special: per spec it is EITHER a destination array
+    # (``[page /Fit]``, ``[page /XYZ left top zoom]``, ...) OR a single
+    # action dictionary - never an array of multiple actions. Treating its
+    # array form as "an array of actions" (as /Next legitimately allows)
+    # is what let a destination's incidental page-object keys be
+    # misread as an action in earlier versions of this detector: a
+    # destination array's elements are never actions, no matter what keys
+    # they carry, so they must not be inspected as actions at all.
+    def open_action_has_js(oa_ref, seen: set[int]) -> bool:
+        oa = resolve(oa_ref)
+        if isinstance(oa, ArrayObject):
+            return False
+        return action_has_js(oa, seen)
+
+    # An additional-actions dict: each value is a single action (or a
+    # /Next-chained one), keyed by trigger event name. Only the event keys
+    # the owning structure actually defines (PDF 32000-1:2008 tables
+    # 194/195/197) are trigger events; anything else is inert data someone
+    # stashed under /AA and must not be treated as an action.
+    def aa_has_js(aa_ref, allowed_keys: frozenset, seen: set[int]) -> bool:
+        aa = resolve(aa_ref)
+        if not isinstance(aa, DictionaryObject):
+            return False
+        try:
+            values = [v for k, v in dict.items(aa) if k in allowed_keys]
+        except Exception:
+            return False
+        return any(action_has_js(value, seen) for value in values)
+
+    _PAGE_AA_KEYS = frozenset({"/O", "/C"})
+    _ANNOT_AA_KEYS = frozenset({
+        "/E", "/X", "/D", "/U", "/Fo", "/Bl", "/PO", "/PC", "/PV", "/PI",
+    })
+    _FIELD_AA_KEYS = frozenset({"/K", "/F", "/V", "/C"})
+    _CATALOG_AA_KEYS = frozenset({"/WC", "/WS", "/DS", "/WP", "/DP"})
+
+    # PDF name trees (the structure ``/Names -> /JavaScript`` uses) are
+    # either a leaf node (a flat ``/Names`` array) or an intermediate node
+    # with ``/Kids`` pointing to further child nodes - real documents with
+    # many named scripts commonly split the tree this way. Collect every
+    # action reference from every leaf, cycle-protected by node identity.
+    def name_tree_action_refs(node_ref, seen_nodes: set[int]) -> list:
+        refs: list = []
+        stack = [node_ref]
+        while stack:
+            node = stack.pop()
+            try:
+                node = resolve(node)
+                if not isinstance(node, DictionaryObject) or id(node) in seen_nodes:
+                    continue
+                seen_nodes.add(id(node))
+                if "/Names" in node:
+                    arr = resolve(node["/Names"])
+                    if isinstance(arr, ArrayObject):
+                        # Alternating (name, action-ref) pairs - the refs
+                        # are at the odd indices.
+                        refs.extend(list(arr)[1::2])
+                if "/Kids" in node:
+                    kids = resolve(node["/Kids"])
+                    if isinstance(kids, ArrayObject):
+                        stack.extend(kids)
+            except Exception:
+                continue
+        return refs
+
+    seen_actions: set[int] = set()
+    seen_pages: set[int] = set()
+    # A single indirect Widget-annotation dictionary is routinely referenced
+    # from BOTH a page's /Annots array AND (as a merged field/widget) from
+    # /AcroForm/Fields, with different action keys meaningful in each role
+    # (an annotation's /A and /AA event set vs. a field's). Deduplicating
+    # those two roles through one shared "seen" set let visiting it in one
+    # role suppress ever checking the other role's actions - use separate
+    # sets so each role is still examined once.
+    seen_annots: set[int] = set()
+    seen_fields: set[int] = set()
+
+    try:
+        root = resolve(reader.trailer["/Root"]) if "/Root" in reader.trailer else None
+    except Exception:
+        root = None
+    if not isinstance(root, DictionaryObject):
+        return False
+
+    try:
+        if "/OpenAction" in root and open_action_has_js(root["/OpenAction"], seen_actions):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if "/AA" in root and aa_has_js(root["/AA"], _CATALOG_AA_KEYS, seen_actions):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if "/Names" in root:
+            names = resolve(root["/Names"])
+            if isinstance(names, DictionaryObject) and "/JavaScript" in names:
+                js_tree = names["/JavaScript"]
+                for value in name_tree_action_refs(js_tree, set()):
+                    if action_has_js(value, seen_actions):
+                        return True
+    except Exception:
+        pass
+
+    try:
+        pages = list(reader.pages)
+    except Exception:
+        pages = []
+    for page in pages:
+        try:
+            if not isinstance(page, DictionaryObject) or id(page) in seen_pages:
+                continue
+            seen_pages.add(id(page))
+            if "/AA" in page and aa_has_js(page["/AA"], _PAGE_AA_KEYS, seen_actions):
+                return True
+            if "/Annots" not in page:
+                continue
+            annots = resolve(page["/Annots"])
+            if not isinstance(annots, ArrayObject):
+                continue
+            for annot_ref in annots:
+                annot = resolve(annot_ref)
+                if not isinstance(annot, DictionaryObject) or id(annot) in seen_annots:
+                    continue
+                seen_annots.add(id(annot))
+                if "/A" in annot and action_has_js(annot["/A"], seen_actions):
+                    return True
+                if "/AA" in annot and aa_has_js(annot["/AA"], _ANNOT_AA_KEYS, seen_actions):
+                    return True
+        except Exception:
+            continue
+
+    try:
+        acro = resolve(root["/AcroForm"]) if "/AcroForm" in root else None
+    except Exception:
+        acro = None
+    if isinstance(acro, DictionaryObject):
+        try:
+            fields = resolve(acro["/Fields"]) if "/Fields" in acro else None
+        except Exception:
+            fields = None
+        stack = list(fields) if isinstance(fields, ArrayObject) else []
+        while stack:
+            field_ref = stack.pop()
+            try:
+                field = resolve(field_ref)
+                if not isinstance(field, DictionaryObject) or id(field) in seen_fields:
+                    continue
+                seen_fields.add(id(field))
+                if "/A" in field and action_has_js(field["/A"], seen_actions):
+                    return True
+                if "/AA" in field and aa_has_js(field["/AA"], _FIELD_AA_KEYS, seen_actions):
+                    return True
+                if "/Kids" in field:
+                    kids = resolve(field["/Kids"])
+                    if isinstance(kids, ArrayObject):
+                        stack.extend(kids)
+            except Exception:
+                continue
+
+    # Outline (bookmark) items form their own tree, navigated via /First
+    # (first child) and /Next (next sibling) - a different meaning of
+    # /Next than an action's chain, so this is deliberately not routed
+    # through action_has_js's /Next handling. Each item may carry its own
+    # /A action, triggered when the bookmark is clicked.
+    try:
+        outlines = resolve(root["/Outlines"]) if "/Outlines" in root else None
+    except Exception:
+        outlines = None
+    if isinstance(outlines, DictionaryObject):
+        seen_outline: set[int] = set()
+        stack = [outlines["/First"]] if "/First" in outlines else []
+        while stack:
+            item_ref = stack.pop()
+            try:
+                item = resolve(item_ref)
+                if not isinstance(item, DictionaryObject) or id(item) in seen_outline:
+                    continue
+                seen_outline.add(id(item))
+                if "/A" in item and action_has_js(item["/A"], seen_actions):
+                    return True
+                if "/First" in item:
+                    stack.append(item["/First"])
+                if "/Next" in item:
+                    stack.append(item["/Next"])
+            except Exception:
+                continue
 
     return False
 
@@ -184,8 +411,8 @@ def flatten_pdf(
         raise RuntimeError("Refusing to flatten PDF in place")
 
     # PDFium is not thread-safe. Serialise the body so concurrent batch
-    # workers can't race PDFium's global state (see ``_PDFIUM_LOCK``).
-    with _PDFIUM_LOCK:
+    # workers can't race PDFium's global state (see ``PDFIUM_LOCK``).
+    with PDFIUM_LOCK:
         _flatten_pdf_locked(src, dst, progress=progress, cancelled=cancelled)
 
 
@@ -196,11 +423,9 @@ def _flatten_pdf_locked(
     progress: Callable[[int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
-    # Imports are local because pypdfium2 / PIL are heavy and the module is
-    # also imported for the cheap ``has_pdf_javascript`` detection path.
+    # The import is local because pypdfium2 is heavy and the module is also
+    # imported for the cheap ``has_pdf_javascript`` detection path.
     import pypdfium2 as pdfium  # type: ignore[import-untyped]
-    from PIL import Image
-
     _log.info("flatten: src=%s dst=%s dpi=%d", src, dst, _RENDER_DPI)
 
     try:
@@ -234,8 +459,12 @@ def _flatten_pdf_locked(
         warnings.simplefilter("always")
         try:
             pdf.init_forms()
-        except pdfium.PdfiumError as exc:
-            # Real failure (rare) — surface it.
+        except Exception as exc:
+            # Real failure (rare) - surface it. Catch any exception, not
+            # only PdfiumError: an unclosed ``pdf`` here would otherwise
+            # leak the native document past the point where the shared
+            # lock is released, letting its eventual GC-triggered close
+            # race another thread's PDFium call outside the lock.
             pdf.close()
             _log.error(
                 "flatten: could not initialize PDF form environment: %s", exc,
@@ -261,129 +490,96 @@ def _flatten_pdf_locked(
         _log.error("flatten: PDF contains no pages: %s", src)
         raise RuntimeError("PDF contains no pages")
 
-    if progress:
-        progress(5)
-
-    # Two-phase assembly: render each page to a JPEG on disk (only one
-    # full-resolution bitmap is alive at any moment), then append the
-    # JPEGs into the output PDF one page at a time — the same idiom as
-    # ``_enhance_scanned_pdf``. (An earlier note here claimed PIL's
-    # append-mode PDF writer broke past ~4 pages with "trailer loop
-    # found"; that does not reproduce on the Pillow this app pins —
-    # probed clean through 100+ pages.) The tempdir is unlinked
-    # automatically when the ``with`` block exits.
+    # Render and append one page at a time. Passing the explicit quality to
+    # PIL's PDF writer encodes each bitmap once; the previous JPEG tempfile
+    # spool decoded quality-92 JPEGs and then encoded them again at PIL's
+    # default quality. Resident memory remains bounded to one page.
     scale = _RENDER_DPI / 72.0
     cancelled_early = False
     rendered_any = False
-    with tempfile.TemporaryDirectory(prefix="cove-flatten-pages-") as tmpdir:
-        page_files: list[Path] = []
-        try:
-            for i in range(n):
-                if cancelled and cancelled():
-                    cancelled_early = True
-                    return
+    try:
+        # Inside the try/finally that owns ``pdf``: a ``progress`` callback
+        # raising here must not leak the native document past the point
+        # where the shared lock is released (see the init_forms note above).
+        if progress:
+            progress(5)
 
-                try:
-                    page = pdf[i]
-                except Exception as exc:
-                    _log.error(
-                        "flatten: could not load page %d/%d: %s", i + 1, n, exc,
-                    )
-                    raise RuntimeError(
-                        f"Could not load page {i + 1}/{n}: {exc}"
-                    ) from exc
+        for i in range(n):
+            if cancelled and cancelled():
+                cancelled_early = True
+                break
 
+            try:
+                page = pdf[i]
+            except Exception as exc:
+                _log.error(
+                    "flatten: could not load page %d/%d: %s", i + 1, n, exc,
+                )
+                raise RuntimeError(
+                    f"Could not load page {i + 1}/{n}: {exc}"
+                ) from exc
+
+            try:
+                bitmap = page.render(scale=scale)
                 try:
-                    bitmap = page.render(scale=scale)
-                    try:
-                        pil = bitmap.to_pil()
-                    finally:
-                        bitmap.close()
-                except Exception as exc:
-                    _log.error(
-                        "flatten: could not render page %d/%d: %s",
-                        i + 1, n, exc,
-                    )
-                    raise RuntimeError(
-                        f"Could not render page {i + 1}/{n}: {exc}"
-                    ) from exc
+                    pil = bitmap.to_pil()
                 finally:
-                    page.close()
+                    bitmap.close()
+            except Exception as exc:
+                _log.error(
+                    "flatten: could not render page %d/%d: %s",
+                    i + 1, n, exc,
+                )
+                raise RuntimeError(
+                    f"Could not render page {i + 1}/{n}: {exc}"
+                ) from exc
+            finally:
+                page.close()
 
-                page_path = Path(tmpdir) / f"page_{i:04d}.jpg"
-                try:
-                    if pil.mode != "RGB":
-                        converted = pil.convert("RGB")
-                        pil.close()
-                        pil = converted
-                    pil.save(
-                        str(page_path), "JPEG", quality=_JPEG_QUALITY,
-                    )
-                except Exception as exc:
-                    _log.error(
-                        "flatten: could not write page %d/%d bitmap to %s: %s",
-                        i + 1, n, page_path, exc,
-                    )
-                    raise RuntimeError(
-                        f"Could not write page {i + 1}/{n} bitmap: {exc}"
-                    ) from exc
-                finally:
+            try:
+                if pil.mode != "RGB":
+                    converted = pil.convert("RGB")
                     pil.close()
-                    del pil
-                page_files.append(page_path)
-                rendered_any = True
+                    pil = converted
+                pil.save(
+                    str(dst), "PDF",
+                    resolution=float(_RENDER_DPI),
+                    quality=_JPEG_QUALITY,
+                    append=rendered_any,
+                )
+            except Exception as exc:
+                _log.error(
+                    "flatten: could not write page %d/%d to PDF: %s",
+                    i + 1, n, exc,
+                )
+                raise RuntimeError(
+                    f"Could not assemble flattened PDF page {i + 1}/{n}: {exc}"
+                ) from exc
+            finally:
+                pil.close()
+                del pil
+            rendered_any = True
 
-                if progress:
-                    # Reserve 70 % of the bar for rendering, save the
-                    # remainder for the assemble + validate steps.
-                    progress(5 + int(70 * (i + 1) / n))
-        finally:
-            pdf.close()
-
-        if cancelled and cancelled():
-            return
-
-        if not page_files:
-            _log.error("flatten: no page bitmaps were produced from %s", src)
-            raise RuntimeError("flatten produced no pages")
-
-        try:
-            # One page open at a time: the eager append_images list held one
-            # open file descriptor per page and died with "Too many open
-            # files" on 1000+-page documents (PIL materialises append_images
-            # into a list internally, so a lazy iterable can't help). The
-            # per-page append idiom keeps exactly one fd and one decoded
-            # page resident regardless of page count, and preserves the
-            # JPEG DCTDecode pass-through per page.
-            for idx, page_path in enumerate(page_files):
-                with Image.open(str(page_path)) as page_im:
-                    page_im.save(
-                        str(dst), "PDF",
-                        resolution=float(_RENDER_DPI),
-                        append=idx > 0,
-                    )
-        except Exception as exc:
-            # Tempdir cleanup is automatic, but the partial dst file is
-            # ours to drop.
-            if dst.exists():
-                try:
-                    dst.unlink()
-                except OSError:
-                    pass
-            _log.error(
-                "flatten: could not assemble PDF from %d page bitmap(s): %s",
-                len(page_files), exc,
-            )
-            raise RuntimeError(
-                f"Could not assemble flattened PDF: {exc}"
-            ) from exc
-
-    # If we bailed before any page rendered, drop any partial dst.
-    if (cancelled_early or not rendered_any) and dst.exists():
+            if progress:
+                progress(5 + int(70 * (i + 1) / n))
+    except Exception:
         try:
             dst.unlink()
         except OSError:
             pass
+        raise
+    finally:
+        pdf.close()
+
+    # If we bailed before any page rendered, drop any partial dst.
+    if cancelled_early or not rendered_any:
+        try:
+            dst.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        return
 
     if cancelled and cancelled():
         # Cancelled after the assemble step succeeded but before
@@ -401,6 +597,16 @@ def _flatten_pdf_locked(
 
     if progress:
         progress(85)
+
+    # Keep a checkpoint immediately before validation. This catches a cancel
+    # delivered after the final page save/progress callback and ensures the
+    # complete-but-unwanted output is removed.
+    if cancelled and cancelled():
+        try:
+            dst.unlink()
+        except OSError:
+            pass
+        return
 
     # Post-write validation. Acceptance criterion #6 / "Suggested safety
     # checks" in the handoff: confirm the output is plausible before we
