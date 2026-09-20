@@ -4,10 +4,12 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from cove_converter.binaries import resource_path
+from cove_converter.updater import acknowledge_updated_startup
 from cove_converter.ui.main_window import MainWindow
 from cove_converter.ui.theme import apply_global_theme
 
@@ -96,6 +98,10 @@ def main() -> int:
 
     window = MainWindow()
     window.show()
+    # A zero-delay callback runs only after Qt's event loop is servicing the
+    # shown window. The previous AppImage keeps its rollback binary until it
+    # receives this launch-specific acknowledgement.
+    QTimer.singleShot(0, acknowledge_updated_startup)
     return app.exec()
 
 

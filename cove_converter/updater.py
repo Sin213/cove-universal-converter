@@ -28,16 +28,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtCore import QObject, QSignalBlocker, QTimer, Qt, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from .system_open import open_url as _open_url
@@ -52,6 +57,78 @@ _ASSET_HOSTS = frozenset({
 })
 _MAX_RELEASE_JSON_BYTES = 2 * 1024 * 1024
 _MAX_SIDECAR_BYTES = 1024 * 1024
+_STARTUP_TOKEN_ENV = "COVE_UPDATE_STARTUP_TOKEN"
+_STARTUP_ACK_INTERVAL_MS = 100
+_STARTUP_ACK_TIMEOUT_SECONDS = 20.0
+_THREAD_SHUTDOWN_JOIN_SECONDS = 0.25
+_network_context = threading.local()
+
+
+def _interrupt_response(response) -> None:
+    """Wake a concurrent urllib socket read before closing its response."""
+    try:
+        sock = getattr(getattr(response.fp, "raw", None), "_sock", None)
+        if sock is not None:
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        response.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class _Cancellation:
+    """Thread-safe cancellation that also interrupts an active HTTP read."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self._lock = threading.Lock()
+        self._response = None
+
+    def cancel(self) -> None:
+        self.event.set()
+        with self._lock:
+            response = self._response
+        if response is not None:
+            _interrupt_response(response)
+
+    def track(self, response) -> None:
+        with self._lock:
+            self._response = response
+        if self.event.is_set():
+            _interrupt_response(response)
+            raise RuntimeError("cancelled")
+
+    def clear(self, response=None) -> None:
+        with self._lock:
+            if response is None or self._response is response:
+                self._response = None
+
+
+def _startup_ack_path(token: str) -> Path:
+    return Path(tempfile.gettempdir()) / f".cove-update-{token}.ready"
+
+
+def acknowledge_updated_startup() -> None:
+    """Acknowledge that an updated process reached the GUI event loop."""
+    token = os.environ.pop(_STARTUP_TOKEN_ENV, "")
+    if len(token) != 64 or any(char not in "0123456789abcdef" for char in token):
+        return
+    path = _startup_ack_path(token)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.write(fd, token.encode("ascii"))
+        finally:
+            os.close(fd)
+    except OSError:
+        # Startup must not fail because an acknowledgement cannot be written.
+        # The previous process will time out and retain its binary.
+        pass
 
 
 def _validate_repo(repo: str) -> tuple[str, str]:
@@ -105,6 +182,9 @@ def _open_trusted(
     _validate_https_url(request.full_url, allowed_hosts)
     opener = urllib.request.build_opener(_TrustedRedirectHandler(allowed_hosts))
     response = opener.open(request, timeout=timeout)  # nosec B310
+    cancellation = getattr(_network_context, "cancellation", None)
+    if cancellation is not None:
+        cancellation.track(response)
     try:
         _validate_https_url(response.geturl(), allowed_hosts)
     except Exception:
@@ -222,22 +302,36 @@ class UpdateCheckWorker(QObject):
     updateAvailable = Signal(object)   # UpdateInfo
     noUpdate = Signal()
     failed = Signal(str)
+    done = Signal()
 
     def __init__(self, current_version: str, repo: str) -> None:
         super().__init__()
         self._current = current_version
         self._repo = repo
+        self._cancellation = _Cancellation()
+
+    def cancel(self) -> None:
+        self._cancellation.cancel()
 
     def run(self) -> None:
-        # Any escape here would leave the thread's event loop running with
-        # no quit signal ever emitted, wedging every future check() — treat
-        # a malformed API payload the same as an unreachable API.
+        # Treat malformed API payloads like an unreachable API, and always
+        # emit done so the controller can permit a later check.
+        _network_context.cancellation = self._cancellation
         try:
             self._run()
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"unexpected release payload: {exc}")
+        finally:
+            self._cancellation.clear()
+            try:
+                del _network_context.cancellation
+            except AttributeError:
+                pass
+            self.done.emit()
 
     def _run(self) -> None:
+        if self._cancellation.event.is_set():
+            return
         data = fetch_latest_release(self._repo)
         if data is None:
             self.failed.emit("could not reach the releases API")
@@ -319,10 +413,12 @@ def _fetch_sidecar(url: str, repo: str, timeout: float = 20.0) -> str:
     return body.decode("utf-8", errors="replace")
 
 
-def _hash_file(path: Path, chunk: int = 262144) -> str:
+def _hash_file(path: Path, chunk: int = 262144, cancelled=None) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
         while True:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("cancelled")
             block = f.read(chunk)
             if not block:
                 break
@@ -343,6 +439,7 @@ class DownloadWorker(QObject):
     progress = Signal(int)           # 0–100
     finished = Signal(str, str)      # (installed/downloaded path, replaced old path or "")
     failed = Signal(str)
+    done = Signal()
 
     def __init__(
         self,
@@ -360,11 +457,39 @@ class DownloadWorker(QObject):
         self._install_appimage = install_appimage
         self._verified_digest: str | None = None
         self._cancelled = False
+        self._cancellation = _Cancellation()
+        # Serializes cancel() against the swap-then-decide step below so the
+        # decision to keep or roll back a completed swap is atomic with the
+        # cancellation flag: cancel() either lands before the decision (seen
+        # as True, rolled back) or blocks until finished has been queued.
+        #
+        # Accepted residual limitation: both this lock's acquisition in
+        # cancel() and the shutdown join around it are bounded (see
+        # _THREAD_SHUTDOWN_JOIN_SECONDS), by design - shutdown must not hang
+        # indefinitely. If the code inside the lock (a local file rename or
+        # a Qt signal emit) ever took longer than that bound, a decision
+        # could still be mid-flight when the interpreter exits and daemon
+        # threads are cut off. This requires an anomalously slow local
+        # rename/emit (well beyond normal disk I/O) and has no bounded-wait
+        # fix; closing it fully would need a durable on-disk journal a
+        # future startup could use to self-heal. Accepted as out of scope
+        # for this fix; not expected to occur under normal conditions.
+        self._commit_lock = threading.Lock()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        # Bounded: if the worker is holding the lock mid swap-commit
+        # decision, wait for it to finish (so the flag it observes matches
+        # the one it will act on) but never block shutdown indefinitely.
+        acquired = self._commit_lock.acquire(timeout=_THREAD_SHUTDOWN_JOIN_SECONDS)
+        try:
+            self._cancelled = True
+        finally:
+            if acquired:
+                self._commit_lock.release()
+        self._cancellation.cancel()
 
     def run(self) -> None:
+        _network_context.cancellation = self._cancellation
         try:
             _, repo_name = _validate_repo(self._repo)
             req = urllib.request.Request(
@@ -372,6 +497,7 @@ class DownloadWorker(QObject):
                 headers={"User-Agent": f"{repo_name}-updater"},
             )
             with _open_trusted(req, 20, _ASSET_HOSTS) as resp:
+                self._cancellation.track(resp)
                 total = int(resp.headers.get("Content-Length") or 0)
                 written = 0
                 self._dest.parent.mkdir(parents=True, exist_ok=True)
@@ -396,8 +522,13 @@ class DownloadWorker(QObject):
                 # copy off the GUI thread.
                 new_path, old_path = swap_in_appimage(
                     self._dest, expected_sha256=self._verified_digest,
+                    cancelled=lambda: self._cancelled,
                 )
-                self.finished.emit(str(new_path), str(old_path))
+                with self._commit_lock:
+                    if self._cancelled:
+                        UpdateController._roll_back_appimage(new_path, old_path)
+                        raise RuntimeError("cancelled")
+                    self.finished.emit(str(new_path), str(old_path))
             else:
                 self.finished.emit(str(self._dest), "")
         except Exception as exc:  # noqa: BLE001
@@ -405,9 +536,18 @@ class DownloadWorker(QObject):
                 self._dest.unlink(missing_ok=True)
             except Exception:  # noqa: BLE001
                 pass
-            self.failed.emit(str(exc))
+            self.failed.emit("cancelled" if self._cancelled else str(exc))
+        finally:
+            self._cancellation.clear()
+            try:
+                del _network_context.cancellation
+            except AttributeError:
+                pass
+            self.done.emit()
 
     def _verify_checksum(self) -> None:
+        if self._cancelled:
+            raise RuntimeError("cancelled")
         parsed_url = urllib.parse.urlsplit(self._url)
         sidecar_url = urllib.parse.urlunsplit(
             parsed_url._replace(path=f"{parsed_url.path}.sha256")
@@ -418,12 +558,14 @@ class DownloadWorker(QObject):
             raise RuntimeError(
                 f"checksum sidecar missing or unreachable ({sidecar_url}): {exc}"
             ) from exc
+        if self._cancelled:
+            raise RuntimeError("cancelled")
         expected = _parse_sidecar(body, self._asset_name)
         if not expected:
             raise RuntimeError(
                 f"no SHA-256 entry for {self._asset_name!r} in sidecar at {sidecar_url}"
             )
-        actual = _hash_file(self._dest)
+        actual = _hash_file(self._dest, cancelled=lambda: self._cancelled)
         if actual != expected:
             raise RuntimeError(
                 f"checksum mismatch for {self._asset_name}: "
@@ -434,6 +576,7 @@ class DownloadWorker(QObject):
 
 def swap_in_appimage(
     new_path: Path, expected_sha256: str | None = None,
+    *, cancelled=None,
 ) -> tuple[Path, Path]:
     """Install `new_path` next to the running AppImage under its own
     versioned filename and return ``(new target path, old path)``.
@@ -461,13 +604,17 @@ def swap_in_appimage(
     made_rollback_copy = False
     tmp = target.with_name(target.name + ".part")
     try:
+        if cancelled and cancelled():
+            raise RuntimeError("cancelled")
         if target == old:
             rollback = old.with_name(old.name + ".cove-rollback")
             shutil.copy2(old, rollback)
             made_rollback_copy = True
+        if cancelled and cancelled():
+            raise RuntimeError("cancelled")
         shutil.move(str(new_path), str(tmp))
         if expected_sha256 is not None:
-            actual = _hash_file(tmp)
+            actual = _hash_file(tmp, cancelled=cancelled)
             if actual != expected_sha256:
                 raise RuntimeError(
                     f"checksum mismatch after staging: "
@@ -475,6 +622,8 @@ def swap_in_appimage(
                 )
         mode = os.stat(tmp).st_mode
         os.chmod(tmp, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        if cancelled and cancelled():
+            raise RuntimeError("cancelled")
         os.replace(tmp, target)
     except Exception:
         # Never leave stale staging/rollback files next to the install on
@@ -493,17 +642,21 @@ def swap_in_appimage(
     return target, rollback
 
 
-def relaunch(path: Path) -> None:
+def relaunch(path: Path, startup_token: str | None = None) -> subprocess.Popen:
     """Spawn `path` detached from the current process group so it survives
     our own exit — the running process keeps the old binary mmap'd while
     the new one takes over the path on disk."""
-    subprocess.Popen(
+    env = os.environ.copy()
+    if startup_token is not None:
+        env[_STARTUP_TOKEN_ENV] = startup_token
+    return subprocess.Popen(
         [str(path)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
         start_new_session=True,
+        env=env,
     )
 
 
@@ -525,21 +678,31 @@ class UpdateController(QObject):
         self._repo = repo
         self._display_name = app_display_name
         self._cache_subdir = cache_subdir
-        self._thread: QThread | None = None
+        self._thread: threading.Thread | None = None
         self._worker: UpdateCheckWorker | None = None
-        self._download_thread: QThread | None = None
+        self._download_thread: threading.Thread | None = None
         self._download_worker: DownloadWorker | None = None
         self._progress: QProgressDialog | None = None
         self._prompt_shown = False
+        self._relaunch_process: subprocess.Popen | None = None
+        self._relaunch_timer: QTimer | None = None
+        self._relaunch_token: str | None = None
+        self._relaunch_deadline = 0.0
+        self._relaunch_new_path: Path | None = None
+        self._relaunch_rollback: Path | None = None
+        self._shutting_down = False
         app = QApplication.instance()
         if app is not None:
-            # Qt destroys parented QThreads on teardown; give in-flight
-            # check/download threads a chance to finish first, or the
-            # process aborts with "QThread: Destroyed while thread is
-            # still running".
+            # Active responses are closed first. The bounded joins allow the
+            # common path to clean up while daemon threads keep a slow DNS or
+            # connect syscall from owning Qt objects during application exit.
             app.aboutToQuit.connect(self._shutdown_threads)
 
     def _shutdown_threads(self) -> None:
+        # Flushing queued events below can deliver an already-pending
+        # updateAvailable signal; block any handler that would show a new
+        # modal prompt or start a new download during shutdown.
+        self._shutting_down = True
         for worker, thread in (
             (self._worker, self._thread),
             (self._download_worker, self._download_thread),
@@ -550,23 +713,52 @@ class UpdateController(QObject):
                 cancel = getattr(worker, "cancel", None)
                 if cancel is not None:
                     cancel()
-            thread.quit()
-            thread.wait(10000)
+            # cancel() (above) already waits, bounded, for an in-flight
+            # swap-commit decision to finish before returning, so by this
+            # point the worker's decision (finish or roll back) is settled
+            # in the common case; this join only waits for its thread
+            # object to fully terminate.
+            thread.join(_THREAD_SHUTDOWN_JOIN_SECONDS)
+        app = QApplication.instance()
+        if app is not None:
+            # A worker that finished (including a same-name swap already
+            # written to disk) just before shutdown began has its
+            # finished/failed signal queued but not yet delivered. Flush it
+            # now so cancel()'s effect on _cancelled is observed by
+            # _on_downloaded and an unacknowledged swap is rolled back
+            # instead of left installed.
+            app.processEvents()
+        if self._relaunch_process is not None:
+            # The child may have written its acknowledgement between the
+            # last poll tick and shutdown starting. Check it directly rather
+            # than unconditionally discarding an already-successful install.
+            token = self._relaunch_token
+            acknowledged = False
+            if token is not None:
+                try:
+                    acknowledged = (
+                        _startup_ack_path(token).read_text("ascii") == token
+                    )
+                except (OSError, UnicodeDecodeError):
+                    acknowledged = False
+            if acknowledged:
+                self._finish_relaunch_success()
+            else:
+                self._finish_relaunch_failure("startup was cancelled", warn=False)
 
     def check(self) -> None:
-        if self._thread is not None:
+        if self._shutting_down or self._thread is not None:
             return
-        thread = QThread(self)
         worker = UpdateCheckWorker(self._current, self._repo)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.updateAvailable.connect(thread.quit)
-        worker.noUpdate.connect(thread.quit)
-        worker.failed.connect(thread.quit)
+        thread = threading.Thread(
+            target=worker.run,
+            name="cove-update-check",
+            daemon=True,
+        )
         worker.updateAvailable.connect(
             self._on_update_available, Qt.ConnectionType.QueuedConnection
         )
-        thread.finished.connect(
+        worker.done.connect(
             self._on_check_done, Qt.ConnectionType.QueuedConnection
         )
         self._thread = thread
@@ -578,7 +770,7 @@ class UpdateController(QObject):
         self._worker = None
 
     def _on_update_available(self, info: UpdateInfo) -> None:
-        if self._prompt_shown:
+        if self._shutting_down or self._prompt_shown:
             return
         self._prompt_shown = True
         self._prompt(info)
@@ -646,19 +838,16 @@ class UpdateController(QObject):
         self._progress.setMinimumDuration(0)
         self._progress.setValue(0)
 
-        thread = QThread(self)
         worker = DownloadWorker(
             info.asset_url, dest, self._repo, name, install_appimage=True,
         )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        # DirectConnection: the worker thread's event loop is blocked inside
-        # run() for the whole download, so a (default) queued invocation of
-        # cancel() would never be delivered until the download had already
-        # finished. cancel() only sets a bool, so calling it from the GUI
-        # thread is safe.
+        thread = threading.Thread(
+            target=worker.run,
+            name="cove-update-download",
+            daemon=True,
+        )
+        # cancel() is thread-safe and closes the active response, allowing a
+        # blocked network read to return promptly during user cancellation.
         self._progress.canceled.connect(
             worker.cancel, Qt.ConnectionType.DirectConnection
         )
@@ -674,7 +863,7 @@ class UpdateController(QObject):
         worker.failed.connect(
             self._on_download_failed, Qt.ConnectionType.QueuedConnection
         )
-        thread.finished.connect(
+        worker.done.connect(
             self._on_download_thread_done, Qt.ConnectionType.QueuedConnection
         )
         self._download_thread = thread
@@ -684,67 +873,158 @@ class UpdateController(QObject):
     def _on_downloaded(
         self, new_path_str: str, rollback_str: str, worker: DownloadWorker,
     ) -> None:
-        if self._progress is not None:
-            self._progress.close()
+        self._close_progress()
         new_path = Path(new_path_str)
         rollback = Path(rollback_str) if rollback_str else None
-        # A ``.cove-rollback`` sibling means the update reused the running
-        # file's name and the old bytes only survive in that copy.
-        same_name = (
-            rollback is not None
-            and rollback.name.endswith(".cove-rollback")
-        )
-        def _roll_back() -> None:
-            # The old bytes were kept on disk for exactly this case.
-            if rollback is None:
-                return
-            try:
-                if same_name:
-                    # Restore the old bytes over the overwritten file.
-                    os.replace(rollback, new_path)
-                else:
-                    new_path.unlink(missing_ok=True)
-                    os.environ["APPIMAGE"] = str(rollback)
-            except OSError:
-                pass
-
         if worker._cancelled:
             # Cancelled between swap completion and this slot: undo the
             # swap so a cancelled update never takes effect, not even on
             # the next launch.
-            _roll_back()
+            self._roll_back_appimage(new_path, rollback)
             return
+        token = secrets.token_hex(32)
+        ack_path = _startup_ack_path(token)
         try:
-            relaunch(new_path)
+            ack_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            process = relaunch(new_path, token)
         except Exception as exc:  # noqa: BLE001
-            _roll_back()
+            self._roll_back_appimage(new_path, rollback)
             QMessageBox.warning(
                 self._parent, "Update failed",
                 f"Couldn't start the updated AppImage:\n{exc}\n"
                 "The previous version was kept.",
             )
             return
-        # New process is running; now it's safe to drop the old copy
-        # (the previous versioned file, or the same-name rollback sibling).
-        if rollback is not None and rollback != new_path:
+
+        # Popen succeeding only proves exec was attempted. Keep the rollback
+        # binary until the replacement reaches its GUI event loop and writes
+        # the launch-specific acknowledgement token.
+        self._relaunch_process = process
+        self._relaunch_token = token
+        self._relaunch_deadline = time.monotonic() + _STARTUP_ACK_TIMEOUT_SECONDS
+        self._relaunch_new_path = new_path
+        self._relaunch_rollback = rollback
+        timer = QTimer(self)
+        timer.setInterval(_STARTUP_ACK_INTERVAL_MS)
+        timer.timeout.connect(self._poll_relaunch)
+        self._relaunch_timer = timer
+        timer.start()
+
+    @staticmethod
+    def _roll_back_appimage(new_path: Path, rollback: Path | None) -> None:
+        if rollback is None:
+            return
+        try:
+            if rollback.name.endswith(".cove-rollback"):
+                os.replace(rollback, new_path)
+                os.environ["APPIMAGE"] = str(new_path)
+            else:
+                new_path.unlink(missing_ok=True)
+                os.environ["APPIMAGE"] = str(rollback)
+        except OSError:
+            pass
+
+    def _poll_relaunch(self) -> None:
+        if self._shutting_down:
+            # _shutdown_threads owns the pending relaunch during shutdown
+            # (it does its own ack check); a timer tick flushed by its
+            # event-processing pass must not race that or show a dialog.
+            return
+        process = self._relaunch_process
+        token = self._relaunch_token
+        if process is None or token is None:
+            return
+        try:
+            exit_code = process.poll()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_relaunch_failure(f"couldn't monitor startup: {exc}")
+            return
+        if exit_code is not None:
+            self._finish_relaunch_failure(
+                f"the updated AppImage exited during startup (code {exit_code})"
+            )
+            return
+        try:
+            acknowledged = _startup_ack_path(token).read_text("ascii") == token
+        except (OSError, UnicodeDecodeError):
+            acknowledged = False
+        if acknowledged:
+            self._finish_relaunch_success()
+        elif time.monotonic() >= self._relaunch_deadline:
+            self._finish_relaunch_failure(
+                "the updated AppImage did not finish starting in time"
+            )
+
+    def _clear_relaunch_state(self) -> tuple[Path | None, Path | None]:
+        timer = self._relaunch_timer
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        token = self._relaunch_token
+        if token is not None:
             try:
-                rollback.unlink()  # unlinking the running file is fine on Linux
+                _startup_ack_path(token).unlink(missing_ok=True)
+            except OSError:
+                pass
+        new_path = self._relaunch_new_path
+        rollback = self._relaunch_rollback
+        self._relaunch_process = None
+        self._relaunch_timer = None
+        self._relaunch_token = None
+        self._relaunch_new_path = None
+        self._relaunch_rollback = None
+        return new_path, rollback
+
+    def _finish_relaunch_success(self) -> None:
+        _new_path, rollback = self._clear_relaunch_state()
+        if rollback is not None:
+            try:
+                rollback.unlink(missing_ok=True)
             except OSError:
                 pass
         app = QApplication.instance()
         if app is not None:
             app.quit()
 
+    def _finish_relaunch_failure(self, reason: str, *, warn: bool = True) -> None:
+        process = self._relaunch_process
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        new_path, rollback = self._clear_relaunch_state()
+        if new_path is not None:
+            self._roll_back_appimage(new_path, rollback)
+        if warn:
+            QMessageBox.warning(
+                self._parent,
+                "Update failed",
+                f"{reason}.\nThe previous version was restored.",
+            )
+
     def _on_download_failed(self, msg: str) -> None:
-        if self._progress is not None:
-            self._progress.close()
-        if msg == "cancelled":
-            # User-initiated; a warning box would be noise.
+        self._close_progress()
+        if msg == "cancelled" or self._shutting_down:
+            # User-initiated, or delivered by shutdown's event flush: a
+            # modal dialog must not block application exit.
             return
         QMessageBox.warning(
             self._parent, "Update failed",
             f"The download didn't complete:\n{msg}",
         )
+
+    def _close_progress(self) -> None:
+        if self._progress is not None:
+            # QProgressDialog.close() emits canceled, even on successful
+            # completion. Closing our own UI must not cancel/roll back the
+            # worker that just finished installing the update.
+            with QSignalBlocker(self._progress):
+                self._progress.close()
 
     def _on_download_thread_done(self) -> None:
         self._download_thread = None
