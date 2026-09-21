@@ -57,6 +57,9 @@ jobs:
       - name: Install Linux libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcairo2-dev pkg-config libegl1 ffmpeg
+      - name: Install Windows libraries
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
       - name: Install pinned dependencies and package
         shell: bash
         run: |
