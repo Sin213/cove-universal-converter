@@ -13,7 +13,10 @@ from cove_converter.updater import swap_in_appimage  # noqa: E402
 class SwapInAppImageTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self._tmp.name)
+        # Resolved to match swap_in_appimage's Path(...).resolve() on APPIMAGE,
+        # since Windows CI runners can expose the same directory under both a
+        # long and an 8.3 short-path alias.
+        self.dir = Path(self._tmp.name).resolve()
         self.cache = self.dir / "cache"
         self.cache.mkdir()
         self.old = self.dir / "cove-pdf-editor-1.2.0-x86_64.AppImage"

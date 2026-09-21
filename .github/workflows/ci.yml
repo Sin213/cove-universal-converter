@@ -32,7 +32,7 @@ jobs:
             requirements-test.txt
       - name: Install Linux libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libcairo2-dev pkg-config libegl1
+        run: sudo apt-get update && sudo apt-get install -y libcairo2-dev pkg-config libegl1 ffmpeg
       - name: Install pinned dependencies and package
         shell: bash
         run: |
