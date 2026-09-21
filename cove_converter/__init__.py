@@ -1,1 +1,5 @@
-__version__ = "2.4.0"
+"""Cove Universal Converter package metadata."""
+
+from .version import PROJECT_VERSION
+
+__version__ = PROJECT_VERSION

@@ -1,0 +1,9 @@
+# Exact build-tool environment shared by Linux and Windows release scripts.
+altgraph==0.17.5
+packaging==26.2
+pefile==2024.8.26; sys_platform == "win32"
+pip==26.1.2
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+pywin32-ctypes==0.2.3; sys_platform == "win32"
+setuptools==83.0.0
