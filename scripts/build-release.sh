@@ -17,6 +17,11 @@ DISPLAY_NAME="Cove Universal Converter"
 # Single source of truth: pyproject.toml. Override with VERSION=… if needed.
 PYPROJECT_VERSION="$(grep -E '^version *= *' "$ROOT/pyproject.toml" | head -1 | sed -E 's/^version *= *"([^"]+)".*/\1/')"
 VERSION="${VERSION:-${PYPROJECT_VERSION:-1.0.0}}"
+VERSION_ARGS=(--version "$VERSION" --project "$ROOT/pyproject.toml")
+if [ -n "${RELEASE_TAG:-}" ]; then
+    VERSION_ARGS+=(--tag "$RELEASE_TAG")
+fi
+VERSION="$(python3 "$ROOT/cove_converter/version.py" "${VERSION_ARGS[@]}")"
 ARCH="x86_64"
 DEB_ARCH="amd64"
 RELEASE_DIR="$ROOT/release"
@@ -62,6 +67,8 @@ PANDOC_SHA256="db556c98cf207d2fddc088d12d2e2f367d9401784d4a3e914b068fa895dcf3f0"
 mkdir -p "$RELEASE_DIR" "$LOCAL_BIN"
 rm -rf "$DIST_DIR" "$ROOT/build"
 mkdir -p "$ROOT/build"
+VERSION_FILE="$ROOT/build/cove-build-version.txt"
+printf '%s\n' "$VERSION" > "$VERSION_FILE"
 
 # ----------------------------------------------------------------------
 # 0. Build venv
@@ -69,8 +76,9 @@ mkdir -p "$ROOT/build"
 echo "==> Creating build venv"
 rm -rf "$BUILD_ENV"
 python3 -m venv "$BUILD_ENV"
-"$BUILD_ENV/bin/pip" install --quiet --upgrade pip
-"$BUILD_ENV/bin/pip" install --quiet -r requirements.txt pyinstaller
+"$BUILD_ENV/bin/python" -m pip install --quiet --require-hashes \
+    -r requirements-runtime.lock
+"$BUILD_ENV/bin/python" -m pip install --quiet -r requirements-build.txt
 
 # ----------------------------------------------------------------------
 # 1. Download ffmpeg + pandoc static builds
@@ -115,10 +123,12 @@ echo "==> Running PyInstaller"
     --name "$APP_NAME" \
     --paths . \
     --add-data "cove_icon.png:." \
+    --add-data "${VERSION_FILE}:." \
     --add-binary "${FFMPEG_BIN}:." \
     --add-binary "${PANDOC_BIN}:." \
     --hidden-import pypdf \
     --hidden-import pillow_heif \
+    --hidden-import scripts.smoke_conversions \
     --collect-all reportlab \
     --collect-all xhtml2pdf \
     --collect-all html5lib \
@@ -136,6 +146,9 @@ echo "==> Running PyInstaller"
 
 BUNDLE="$DIST_DIR/$APP_NAME"
 [ -d "$BUNDLE" ] || { echo "PyInstaller bundle not found at $BUNDLE"; exit 1; }
+echo "==> Validating packaged startup, version, and representative conversions"
+QT_QPA_PLATFORM=offscreen "$BUNDLE/$APP_NAME" \
+    --smoke-test --expect-version "$VERSION"
 
 # ----------------------------------------------------------------------
 # 3. AppImage
@@ -214,6 +227,8 @@ APPIMAGE_OUT="$RELEASE_DIR/${DISPLAY_NAME// /-}-${VERSION}-${ARCH}.AppImage"
 ARCH=$ARCH "$APPIMAGETOOL" --no-appstream "$APPDIR" "$APPIMAGE_OUT"
 chmod +x "$APPIMAGE_OUT"
 echo "    -> $APPIMAGE_OUT"
+QT_QPA_PLATFORM=offscreen "$APPIMAGE_OUT" --appimage-extract-and-run \
+    --smoke-test --expect-version "$VERSION"
 
 # ----------------------------------------------------------------------
 # 4. .deb (manual: ar + tar.xz, no dpkg-deb dependency)
@@ -288,6 +303,8 @@ echo "" >> "$WORK/debian-binary"
 (cd "$WORK" && ar -rc "$DEB_OUT" debian-binary control.tar.xz data.tar.xz)
 
 echo "    -> $DEB_OUT"
+QT_QPA_PLATFORM=offscreen "$PKG_ROOT/usr/lib/$APP_NAME/$APP_NAME" \
+    --smoke-test --expect-version "$VERSION"
 
 # ----------------------------------------------------------------------
 # 5. SHA-256 sidecars

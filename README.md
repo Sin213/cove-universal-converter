@@ -273,7 +273,12 @@ py -m venv .venv
 
 PyInstaller can't cross-compile, so Linux artifacts have to be built on Linux
 and Windows artifacts on Windows. Each platform has its own build script that
-downloads ffmpeg / pandoc automatically and produces the final files.
+downloads hash-verified ffmpeg / pandoc archives and produces the final files.
+Both scripts install the hash-locked runtime set from
+`requirements-runtime.lock` and exact tools from `requirements-build.txt`.
+After an intentional dependency update, regenerate the runtime export with
+`uv export --frozen --no-emit-project --no-dev --format requirements-txt
+--output-file requirements-runtime.lock`.
 
 ### Linux — AppImage + .deb
 
@@ -284,7 +289,9 @@ bash scripts/build-release.sh
 #   cove-universal-converter_2.0.0_amd64.deb
 ```
 
-Override the version with `VERSION=2.0.1 bash scripts/build-release.sh`.
+Override the version with `VERSION=2.4.1 bash scripts/build-release.sh`. The
+build rejects unsafe versions and tag mismatches, then runs real packaged
+conversions before writing checksums.
 
 ### Windows — Setup.exe + Portable.exe
 
@@ -309,6 +316,10 @@ Push a tag matching `v*` (e.g. `v1.0.0`) and
 Both jobs attach their artifacts to the GitHub Release created for the tag,
 using the body from `.github/RELEASE_NOTES_v<version>.md`. The release is
 created as a draft so it can be reviewed before publishing.
+
+`.github/workflows/newci.yml` checks every branch and pull request on Linux
+and Windows with Python 3.11 and 3.12. It installs a regular wheel, runs the
+unit suite, and exercises representative conversions on Python 3.12.
 
 ---
 

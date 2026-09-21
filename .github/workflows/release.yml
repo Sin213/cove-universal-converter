@@ -2,157 +2,158 @@ name: release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version (no leading v)'
+        description: 'Version override (defaults to pyproject.toml)'
         required: false
-        default: '0.0.0-dev'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   resolve-version:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.ver.outputs.version }}
-    steps:
-      - id: ver
-        run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            v="${GITHUB_REF_NAME#v}"
-          else
-            v="${{ github.event.inputs.version }}"
-            [ -z "$v" ] && v="0.0.0-dev"
-          fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-
-  test:
-    runs-on: ubuntu-latest
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          project_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            version="$(python cove_converter/version.py --version "$version" --project pyproject.toml --tag "$GITHUB_REF_NAME")"
+          else
+            version="${INPUT_VERSION:-$project_version}"
+            version="$(python cove_converter/version.py --version "$version" --project pyproject.toml)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+  test:
+    needs: resolve-version
+    name: release tests / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
-
-      - name: Install system dependencies
+          cache-dependency-path: |
+            requirements-runtime.lock
+            requirements-build.txt
+            requirements-test.txt
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcairo2-dev pkg-config libegl1
-
-      - name: Install dependencies
+      - name: Install pinned dependencies and package
+        shell: bash
         run: |
-          pip install pytest
-          pip install -e ".[dev]" 2>/dev/null || pip install -r requirements.txt
-
+          python -m pip install --require-hashes -r requirements-runtime.lock
+          python -m pip install -r requirements-build.txt -r requirements-test.txt
+          python -m pip install --no-deps --no-build-isolation .
+          python -m pip check
       - name: Run tests
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests -q
+      - name: Run representative conversion smoke tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python scripts/smoke_conversions.py --quiet --input .ndjson --input .srt --input .cbz
 
   build-linux:
     needs: [resolve-version, test]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.resolve-version.outputs.version }}
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
-
-      - name: Install system deps
+          cache-dependency-path: |
+            requirements-runtime.lock
+            requirements-build.txt
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            binutils tar xz-utils curl libfuse2 \
-            libcairo2-dev pkg-config
-
-      - name: Run Linux build script
-        run: |
-          chmod +x scripts/build-release.sh
-          bash scripts/build-release.sh
-
-      - name: Upload AppImage
-        uses: actions/upload-artifact@v4
+          sudo apt-get install -y binutils tar xz-utils curl libfuse2 libcairo2-dev pkg-config libegl1
+      - name: Build and validate Linux packages
+        run: bash scripts/build-release.sh
+      - uses: actions/upload-artifact@v4
         with:
-          name: linux-appimage
+          name: linux-release
           path: |
             release/*.AppImage
             release/*.AppImage.sha256
-          if-no-files-found: error
-
-      - name: Upload .deb
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-deb
-          path: |
             release/*.deb
             release/*.deb.sha256
           if-no-files-found: error
-
-      - name: Attach to GitHub Release
+      - name: Attach to draft release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          body_path: .github/RELEASE_NOTES_v${{ needs.resolve-version.outputs.version }}.md
+          fail_on_unmatched_files: true
           files: |
             release/*.AppImage
             release/*.AppImage.sha256
             release/*.deb
             release/*.deb.sha256
-          body_path: .github/RELEASE_NOTES_v${{ needs.resolve-version.outputs.version }}.md
-          fail_on_unmatched_files: true
 
   build-windows:
     needs: [resolve-version, test]
     runs-on: windows-latest
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.resolve-version.outputs.version }}
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Run Windows build script
+          cache: pip
+          cache-dependency-path: |
+            requirements-runtime.lock
+            requirements-build.txt
+      - name: Build and validate Windows packages
         shell: pwsh
         run: .\build.ps1 -Version $env:VERSION
-
-      - name: Upload Setup installer
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: windows-setup
+          name: windows-release
           path: |
             release/*-Setup.exe
             release/*-Setup.exe.sha256
-          if-no-files-found: error
-
-      - name: Upload Portable exe
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-portable
-          path: |
             release/*-Portable.exe
             release/*-Portable.exe.sha256
           if-no-files-found: error
-
-      - name: Attach to GitHub Release
+      - name: Attach to draft release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           draft: true
+          body_path: .github/RELEASE_NOTES_v${{ needs.resolve-version.outputs.version }}.md
+          fail_on_unmatched_files: true
           files: |
             release/*-Setup.exe
             release/*-Setup.exe.sha256
             release/*-Portable.exe
             release/*-Portable.exe.sha256
-          body_path: .github/RELEASE_NOTES_v${{ needs.resolve-version.outputs.version }}.md
-          fail_on_unmatched_files: true

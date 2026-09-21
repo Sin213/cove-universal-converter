@@ -36,6 +36,15 @@ if (-not $Version) {
     if (-not $Version) { $Version = '1.0.0' }
 }
 
+$versionArgs = @(
+    (Join-Path $PSScriptRoot 'cove_converter\version.py'),
+    '--version', $Version,
+    '--project', (Join-Path $PSScriptRoot 'pyproject.toml')
+)
+if ($env:RELEASE_TAG) { $versionArgs += @('--tag', $env:RELEASE_TAG) }
+$Version = (& python @versionArgs | Select-Object -Last 1).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $Version) { throw "Release version validation failed" }
+
 $App         = "cove-universal-converter"
 $ReleaseDir  = "release"
 # Pinned, versioned URLs + SHA-256 (matching the Linux build's policy).
@@ -81,10 +90,10 @@ Step "Building $App v$Version"
 Step "[1/8] Creating build venv"
 if (Test-Path .buildenv) { Remove-Item -Recurse -Force .buildenv }
 python -m venv .buildenv
-& .\.buildenv\Scripts\python.exe -m pip install --quiet --upgrade pip
-# Install runtime deps from requirements.txt (single source of truth) plus
-# pyinstaller for the build itself.
-& .\.buildenv\Scripts\python.exe -m pip install --quiet -r requirements.txt pyinstaller
+& .\.buildenv\Scripts\python.exe -m pip install --quiet --require-hashes -r requirements-runtime.lock
+if ($LASTEXITCODE -ne 0) { throw "Pinned runtime dependency installation failed" }
+& .\.buildenv\Scripts\python.exe -m pip install --quiet -r requirements-build.txt
+if ($LASTEXITCODE -ne 0) { throw "Pinned build dependency installation failed" }
 
 # --- 2. Generate .ico from the PNG ------------------------------------------
 Step "[2/8] Generating cove_icon.ico"
@@ -130,6 +139,9 @@ if (-not $pandocExe) { throw "pandoc.exe missing from downloaded archive" }
 Step "[5/8] PyInstaller (one-dir for installer)"
 if (Test-Path build) { Remove-Item -Recurse -Force build }
 if (Test-Path dist)  { Remove-Item -Recurse -Force dist  }
+New-Item -ItemType Directory -Path build -Force | Out-Null
+$versionFile = (Resolve-Path build).Path + '\cove-build-version.txt'
+[IO.File]::WriteAllText($versionFile, "$Version`n", [Text.UTF8Encoding]::new($false))
 
 $commonArgs = @(
     '--noconfirm', '--clean', '--log-level', 'WARN',
@@ -138,6 +150,7 @@ $commonArgs = @(
     '--icon', 'cove_icon.ico',
     '--paths', '.',
     '--add-data', ("cove_icon.png" + [IO.Path]::PathSeparator + "."),
+    '--add-data', ($versionFile + [IO.Path]::PathSeparator + "."),
     '--collect-all', 'xhtml2pdf',
     '--collect-all', 'reportlab',
     '--collect-all', 'html5lib',
@@ -147,6 +160,7 @@ $commonArgs = @(
     '--collect-all', 'pypdfium2',
     '--hidden-import', 'openpyxl',
     '--hidden-import', 'yaml',
+    '--hidden-import', 'scripts.smoke_conversions',
     '--exclude-module', 'PySide6.QtWebEngineCore',
     '--exclude-module', 'PySide6.QtWebEngineWidgets',
     '--exclude-module', 'PySide6.QtQml',
@@ -172,6 +186,11 @@ if (Test-Path $ffmpegLicense) {
     Copy-Item $ffmpegLicense (Join-Path $dirAppDir "FFMPEG-LICENSE.txt") -Force
 }
 
+Step "Validating packaged startup, version, and representative conversions"
+$smokeProcess = Start-Process -FilePath (Join-Path $dirAppDir "$App.exe") `
+    -ArgumentList @('--smoke-test', '--expect-version', $Version) -Wait -PassThru
+if ($smokeProcess.ExitCode -ne 0) { throw "Packaged onedir smoke test failed" }
+
 # --- 6. PyInstaller: one-file (portable) -------------------------------------
 Step "[6/8] PyInstaller (one-file portable)"
 $portableName = "$App-portable"
@@ -182,6 +201,7 @@ $portableName = "$App-portable"
     --icon cove_icon.ico `
     --paths . `
     --add-data ("cove_icon.png" + [IO.Path]::PathSeparator + ".") `
+    --add-data ($versionFile + [IO.Path]::PathSeparator + '.') `
     --collect-all xhtml2pdf `
     --collect-all reportlab `
     --collect-all html5lib `
@@ -191,6 +211,7 @@ $portableName = "$App-portable"
     --collect-all pypdfium2 `
     --hidden-import openpyxl `
     --hidden-import yaml `
+    --hidden-import scripts.smoke_conversions `
     --exclude-module PySide6.QtWebEngineCore `
     --exclude-module PySide6.QtWebEngineWidgets `
     --exclude-module PySide6.QtQml `
@@ -241,6 +262,11 @@ $portableSrc  = Join-Path 'dist' "$portableName.exe"
 $portableDest = Join-Path $ReleaseDir ("{0}-{1}-Portable.exe" -f $App, $Version)
 if (Test-Path $portableDest) { Remove-Item -Force $portableDest }
 Copy-Item $portableSrc $portableDest -Force
+
+Step "Validating portable executable"
+$smokeProcess = Start-Process -FilePath (Resolve-Path $portableDest).Path `
+    -ArgumentList @('--smoke-test', '--expect-version', $Version) -Wait -PassThru
+if ($smokeProcess.ExitCode -ne 0) { throw "Portable executable smoke test failed" }
 
 Step "Writing SHA-256 sidecars"
 # Cove Nexus mandates `<asset>.sha256` sidecars next to every shipped binary
