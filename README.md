@@ -305,22 +305,6 @@ Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) to be installed
 #   cove-universal-converter-2.0.0-Portable.exe
 ```
 
-### Automated release via GitHub Actions
-
-Push a tag matching `v*` (e.g. `v1.0.0`) and
-`.github/workflows/release.yml` runs the matrix:
-
-- `build-linux` produces the AppImage + .deb on `ubuntu-latest`.
-- `build-windows` produces Setup.exe + Portable.exe on `windows-latest`.
-
-Both jobs attach their artifacts to the GitHub Release created for the tag,
-using the body from `.github/RELEASE_NOTES_v<version>.md`. The release is
-created as a draft so it can be reviewed before publishing.
-
-`.github/workflows/newci.yml` checks every branch and pull request on Linux
-and Windows with Python 3.11 and 3.12. It installs a regular wheel, runs the
-unit suite, and exercises representative conversions on Python 3.12.
-
 ---
 
 ## Troubleshooting
