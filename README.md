@@ -323,33 +323,6 @@ unit suite, and exercises representative conversions on Python 3.12.
 
 ---
 
-## Project layout
-
-```
-cove-universal-converter/
-├── cove_converter/
-│   ├── __main__.py          # entry point (python -m cove_converter)
-│   ├── binaries.py          # resolves ffmpeg/pandoc per-OS
-│   ├── routing.py           # SUPPORTED_FORMATS table
-│   ├── settings.py          # ConversionSettings dataclass
-│   ├── engines/             # one worker per backend
-│   │   ├── base.py          # BaseConverterWorker(QThread)
-│   │   ├── ffmpeg.py        # video + audio
-│   │   ├── pillow.py        # images (+ pillow-heif for HEIC)
-│   │   ├── pandoc.py        # document formats
-│   │   └── pdf.py           # any conversion touching .pdf
-│   └── ui/                  # PySide6 widgets and dialogs
-├── bin/
-│   ├── linux/               # drop ffmpeg + pandoc here for local Linux builds
-│   └── win/                 # drop ffmpeg.exe + pandoc.exe here for Windows
-├── cove_converter.spec      # PyInstaller spec (branches on sys.platform)
-├── .github/workflows/       # cross-platform CI
-├── requirements.txt
-└── pyproject.toml
-```
-
----
-
 ## Troubleshooting
 
 **"Could not find ffmpeg" on launch**
