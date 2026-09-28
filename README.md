@@ -4,7 +4,7 @@ An offline, privacy-first batch file converter. Drop in video, audio, images,
 documents, comics, subtitles, spreadsheets, archives, or structured data and
 convert between 120+ formats - no files leave your machine.
 
-![Cove Universal Converter v2.0.0](docs/screenshot.png)
+https://github.com/user-attachments/assets/488c3c51-117a-4481-9186-76d55241cf76
 
 One codebase, one repository, two native builds: a Windows `.exe` and a Linux
 binary. Everything below assumes you're starting from a fresh clone:
