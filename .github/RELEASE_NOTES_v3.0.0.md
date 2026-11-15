@@ -1,4 +1,6 @@
-# Cove Universal Converter 3.0.0 — Better Batch Conversion
+# Cove Universal Converter 3.0.0 - Better Batch Conversion
+
+## What's new
 
 - Convert one source into several selected formats. Use the per-file **+**
   button or **Outputs / Presets** for batch selection. Single-output conversion
@@ -16,6 +18,32 @@
   Completed paths are available in row tooltips and the context menu.
 - Add SVG input to the supported-formats dialog and smoke matrix. PNG/WebP
   preserve alpha; JPG/PDF flatten onto white. Raster output uses 96 DPI.
+
+## Changed
+
+- The per-file format control now supports several targets (the **+** button)
+  while the single-format dropdown and **Apply format to all** behave as before.
+- The supported-formats dialog and README list SVG as input-only (to PNG, JPG,
+  WebP, PDF). The README documents multi-output, presets and SVG limits.
+- CI and release workflows now run the SVG smoke route on Linux and Windows.
+
+## Fixed
+
+- Output-name collisions are resolved up front for multi-output runs, including
+  case-insensitive and same-stem collisions, so one target can no longer
+  overwrite another target or a queued source.
+- Frozen (PyInstaller) builds dispatch multiprocessing children before GUI
+  startup, so SVG renderer child processes work correctly in packaged builds.
+
+## Hardened / optimized
+
+- SVG rendering runs in an isolated spawned process with a hard 15-second
+  deadline, input/output size caps and POSIX memory limits, and is cleaned up on
+  cancel or timeout.
+- Targets share the existing worker pool and batch concurrency cap, so
+  multi-output runs add no extra parallelism or load.
+- Test suite grew with multi-output, preset, outputs-dialog and SVG coverage
+  (627 tests passing).
 
 ## SVG restrictions
 
