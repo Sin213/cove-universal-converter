@@ -195,13 +195,13 @@ exec "\$HERE/$APP_NAME" "\$@"
 EOF
 chmod +x "$APPDIR/usr/bin/$APP_NAME"
 
-# appimagetool is hash-pinned like ffmpeg/pandoc: the 'continuous' tag is
-# mutable, and a stale cached copy or arbitrary PATH tool would bypass the
+# appimagetool is hash-pinned like ffmpeg/pandoc to the immutable 1.9.1
+# release (the 'continuous' tag is mutable and broke the old pin), and a stale cached copy or arbitrary PATH tool would bypass the
 # pin, so EVERY path is verified. Set APPIMAGETOOL_ALLOW_SYSTEM=1 to
 # explicitly trust an unverified system appimagetool instead.
 # MAINTAINER NOTE: on upstream rebuilds, re-download, sha256sum, and
 # update APPIMAGETOOL_SHA256.
-APPIMAGETOOL_SHA256="${APPIMAGETOOL_SHA256:-a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0}"
+APPIMAGETOOL_SHA256="${APPIMAGETOOL_SHA256:-ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0}"
 appimagetool_hash_ok() {
     [ -f "$1" ] && [ "$(sha256sum "$1" | awk '{print $1}')" = "$APPIMAGETOOL_SHA256" ]
 }
@@ -213,7 +213,7 @@ elif [ "${APPIMAGETOOL_ALLOW_SYSTEM:-0}" = "1" ] && command -v appimagetool >/de
 else
     echo "==> Downloading appimagetool to $APPIMAGETOOL"
     curl -fL --retry 3 --silent --show-error -o "$APPIMAGETOOL" \
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+        "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
     if ! appimagetool_hash_ok "$APPIMAGETOOL"; then
         echo "ERROR: appimagetool sha256 mismatch (expected $APPIMAGETOOL_SHA256)" >&2
         rm -f "$APPIMAGETOOL"
