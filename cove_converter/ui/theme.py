@@ -720,7 +720,7 @@ def category_for(ext: str) -> str:
     if e in (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma", ".aiff"):
         return "audio"
     if e in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif",
-            ".ico", ".heic", ".heif"):
+            ".ico", ".heic", ".heif", ".svg"):
         return "image"
     if e in (".srt", ".vtt"):
         return "subtitle"

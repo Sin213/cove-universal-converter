@@ -55,6 +55,7 @@ class MatrixBuilder(unittest.TestCase):
             "Spreadsheet",
             "Archive",
             "Data",
+            "Svg",
         ):
             self.assertIn(required, engines, f"engine missing from matrix: {required}")
 

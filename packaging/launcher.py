@@ -66,6 +66,7 @@ def _run_smoke(version: str, expected_version: str | None) -> int:
 
     routes = [
         Route(".png", ".jpg", "Pillow"),
+        *(Route(".svg", target, "Svg") for target in (".png", ".jpg", ".webp", ".pdf")),
         Route(".json", ".yaml", "Data"),
         Route(".zip", ".tar", "Archive"),
         Route(".srt", ".vtt", "Subtitle"),
@@ -98,4 +99,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # PyInstaller's multiprocessing hook dispatches renderer children before
+    # they can enter the GUI or packaged smoke argument parser.
+    from multiprocessing import freeze_support
+    freeze_support()
     raise SystemExit(main())

@@ -16,6 +16,66 @@ cd cove-universal-converter
 
 ---
 
+## v3.0.0 - Better batch conversion
+
+- **Several outputs from one file.** Use the **+** beside a file's format
+  dropdown to choose multiple targets. **Outputs / Presets** applies a selection
+  across compatible queued files. The original single-format dropdown and
+  **Apply format to all** still work as before.
+- **Saved presets.** Save a named format selection with the current quality
+  settings, apply it to a file or batch, or delete it. Presets survive restarts
+  in the existing local settings. Names are sanitized and limited to 80
+  characters; up to 32 presets can be saved. Saving the same name replaces it.
+  Unsupported preset targets and busy files are skipped and reported in the
+  summary/log; no substitute format is chosen. Files without a compatible
+  preset target retain their previous selection.
+- **Clear results.** Targets run sequentially for each file under the existing
+  batch concurrency limit. Successful outputs remain available when another
+  target fails or the remainder is cancelled. Rows and batch summaries show
+  complete success, partial success, failure, or cancellation. Hover over the
+  output-count button for selected formats; right-click a completed/partial row
+  to open its outputs or inspect a partial failure log.
+- **SVG input** converts to PNG, JPG, WebP, or PDF, with the restrictions below.
+  Output names are reserved before execution, including case-insensitive
+  collisions and same-stem sources. Existing files retain the overwrite/rename
+  confirmation; case-only collisions are safely renamed. Sources are preserved.
+
+### SVG safety and rendering limits
+
+SVG is input-only. PNG and WebP preserve transparency; JPG and PDF have a white
+background. Raster outputs use SVG's 96-DPI CSS pixel scale. Rendering uses the
+installed svglib/ReportLab subset and PDFium/Pillow, without additional packages.
+
+Only UTF-8, self-contained vector shapes, paths, text, basic gradients, and
+clipping are accepted. Scripts, event handlers, DTDs/entities, processing
+instructions (except an XML declaration), embedded/linked images, `use`,
+external references (including relative paths and symlinks), style elements,
+CSS imports and escaped CSS are rejected with an error. Safe inline styles
+and local `url(#id)` paint/clip references are accepted. Fonts use built-in
+Helvetica, Times, or Courier substitutes; SVG names cannot trigger font-file
+discovery or external font tools. No SVG-controlled network or local resource
+fetching is permitted.
+
+Limits: **2 MiB** input, **10,000** parsed elements, **64** nesting levels,
+**8,192 pixels** per output dimension, and **16 million pixels** total. Parsing
+also rejects attributes longer than **32,768 characters** or containing over
+**4,096 numeric entries**, and conservatively bounds cumulative attribute
+complexity to **250,000 units** (characters plus numeric entries, with ancestor
+attributes counted again for each descendant). This limits inherited lists,
+inline styles, points and path data before rendering. On POSIX, the spawned
+renderer additionally requests **512 MiB address-space/data limits**; these are
+best-effort where supported and unavailable on Windows. Memory exhaustion fails
+the conversion cleanly. Parsing
+and rendering run in a fresh spawned process with a **15-second deadline per
+target**, including startup; cancellation or timeout terminates it (and kills it
+if needed) before temporary-output cleanup. Successful earlier targets remain.
+This is process isolation with input restrictions, not an OS security sandbox.
+
+This is not a browser renderer: filters, masks, animation, foreign objects and
+other unlisted SVG elements are rejected. Text shaping, fonts, gradients,
+clipping and other supported drawing details may differ from browser output.
+Simplify unsupported artwork in a trusted editor before converting it.
+
 ## v2.4.0 - Expanded format coverage
 
 This release focuses on breadth: many more input and output formats across
@@ -176,7 +236,7 @@ it the same way the existing engines are wired — one module under
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Video         | mp4, mkv, webm, mov, avi, mxf, rm, swf, vob, asf, ogv, m2ts, mts, f4v (read/write); y4m, ivf (write-only); flv, wmv, m4v, mpg, mpeg, 3gp, ts, dv, gif (read-only)             |
 | Audio         | mp3, wav, flac, ogg, m4a, aac, opus, ac3, mp2, spx, caf, au, wv, voc, w64, mka, m4b, oga, aif, tta, amr, weba; wma, aiff (read-only)                                          |
-| Images        | png, jpg, jpeg, jpe, jfif, webp, bmp, tiff, tif, ico, heic, heif, avif, jp2, j2k, jpx, tga, pcx, ppm, pgm, pbm, dds, icns                                                     |
+| Images        | png, jpg, jpeg, jpe, jfif, webp, bmp, tiff, tif, ico, heic, heif, avif, jp2, j2k, jpx, tga, pcx, ppm, pgm, pbm, dds, icns; svg (input-only, to png/jpg/webp/pdf)                   |
 | Documents     | pdf, docx, odt, rtf, epub, md, html, htm, txt, tex, adoc, tei, icml, pptx, rst, org, textile, typst, ipynb, fb2, opml, muse, man, native, mediawiki, wiki, dokuwiki, jira, docbook |
 | Comics        | cbz, cbt (to pdf, zip, or tar)                                                                                                                                                |
 | Subtitles     | srt, vtt, ass, ssa, lrc, sbv                                                                                                                                                  |
@@ -193,7 +253,8 @@ in favor of clean editable structure.
 Features:
 
 - Drag-and-drop, click-to-browse, or drop a whole folder (recurses automatically).
-- Per-file target dropdown, or use the "Save to" field to batch-write to one folder.
+- Per-file target dropdown and multiple outputs via **+**, saved presets, or
+  use the "Save to" field to batch-write to one folder.
 - Near-lossless quality by default (CRF 17, preset slow, 320 kbps audio, 95%
   JPEG/WebP). An opt-in "Customize quality settings" checkbox exposes sliders
   if you'd rather trade quality for smaller files.
@@ -285,11 +346,11 @@ After an intentional dependency update, regenerate the runtime export with
 ```bash
 bash scripts/build-release.sh
 # Output in release/:
-#   Cove-Universal-Converter-2.0.0-x86_64.AppImage
-#   cove-universal-converter_2.0.0_amd64.deb
+#   Cove-Universal-Converter-3.0.0-x86_64.AppImage
+#   cove-universal-converter_3.0.0_amd64.deb
 ```
 
-Override the version with `VERSION=2.4.1 bash scripts/build-release.sh`. The
+Override the version with `VERSION=3.0.0 bash scripts/build-release.sh`. The
 build rejects unsafe versions and tag mismatches, then runs real packaged
 conversions before writing checksums.
 
@@ -299,10 +360,10 @@ Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) to be installed
 (bundled on GitHub Actions' `windows-latest`).
 
 ```powershell
-.\build.ps1 -Version 2.0.0
+.\build.ps1 -Version 3.0.0
 # Output in release\:
-#   cove-universal-converter-2.0.0-Setup.exe
-#   cove-universal-converter-2.0.0-Portable.exe
+#   cove-universal-converter-3.0.0-Setup.exe
+#   cove-universal-converter-3.0.0-Portable.exe
 ```
 
 ---

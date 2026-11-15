@@ -72,7 +72,7 @@ jobs:
       - name: Run representative conversion smoke tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python scripts/smoke_conversions.py --quiet --input .ndjson --input .srt --input .cbz
+        run: python scripts/smoke_conversions.py --quiet --input .ndjson --input .srt --input .cbz --input .svg
 
   build-linux:
     needs: [resolve-version, test]

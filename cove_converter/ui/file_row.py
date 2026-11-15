@@ -43,6 +43,17 @@ class FileRow:
     # row enters a Failed state so the UI can show *why* it failed
     # without users having to dig through terminal logs.
     error_log: str | None = None
+    extra_targets: tuple[str, ...] = ()
+    preset_settings: ConversionSettings | None = field(default=None, repr=False)
+    jobs: tuple[ConversionJob, ...] = field(default=(), repr=False)
+    job_index: int = 0
+    target_status: str = "Pending"
+    completed_outputs: list[Path] = field(default_factory=list)
+    target_errors: list[str] = field(default_factory=list, repr=False)
+
+    @property
+    def selected_targets(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((self.target_ext, *self.extra_targets)))
 
     def resolve_output(self, dest_dir: Path | None) -> Path:
         if self.override_output is not None:
@@ -64,11 +75,16 @@ class FileRow:
         return candidate
 
 
+def path_key(path: Path) -> str:
+    return str(path.resolve()).casefold()
+
+
 def unique_path(path: Path, reserved: set[Path] | None = None) -> Path:
     """Return ``path`` if it doesn't exist and isn't already reserved in this batch;
     otherwise append ``(1)``, ``(2)``… until an unused name is found."""
-    reserved = {p.resolve() for p in (reserved or ())}
-    if not path.exists() and not path.is_symlink() and path.resolve() not in reserved:
+    reserved_keys = {path_key(p) for p in (reserved or ())}
+    existing = {p.name.casefold() for p in path.parent.iterdir()} if path.parent.exists() else set()
+    if path.name.casefold() not in existing and path_key(path) not in reserved_keys:
         return path
     stem, parent = effective_stem(path), path.parent
     routed_suffix = effective_suffix(path)
@@ -77,7 +93,7 @@ def unique_path(path: Path, reserved: set[Path] | None = None) -> Path:
     suffix = path.name[-len(routed_suffix):] if routed_suffix else ""
     for i in range(1, 1000):
         candidate = parent / f"{stem} ({i}){suffix}"
-        if (not candidate.exists() and not candidate.is_symlink()
-                and candidate.resolve() not in reserved):
+        if (candidate.name.casefold() not in existing
+                and path_key(candidate) not in reserved_keys):
             return candidate
     raise RuntimeError(f"Could not find a unique name for {path}")

@@ -11,7 +11,9 @@ sliders before they take effect.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
+import json
+import unicodedata
 
 from PySide6.QtCore import QSettings
 
@@ -175,3 +177,124 @@ def load_settings() -> ConversionSettings:
 
 def default_settings() -> ConversionSettings:
     return ConversionSettings()
+
+
+def _preset_name(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Preset name must be text")
+    name = " ".join("".join(
+        " " if unicodedata.category(char).startswith("C") else char for char in value
+    ).split())
+    if not name or len(name) > 80:
+        raise ValueError("Preset names must contain 1–80 characters")
+    return name
+
+
+def _preset_quality(raw: dict) -> ConversionSettings:
+    """Reuse the same readers and bounds as the legacy quality settings."""
+    defaults = ConversionSettings()
+    class Values:
+        def value(self, key, default):
+            return raw.get(key, default)
+    values = Values()
+    result = ConversionSettings()
+    bounds = {
+        "video_crf": (0, 51), "audio_bitrate_kbps": (32, 512),
+        "jpeg_quality": (1, 100), "webp_quality": (1, 100),
+        "max_concurrent": (1, 16), "pdf_enhance_dpi": (72, 600),
+    }
+    choices = {
+        "video_preset": VIDEO_PRESETS, "encoder_pref": ENCODER_KEYS,
+        "video_codec": VIDEO_CODEC_KEYS, "m4a_codec": M4A_CODEC_KEYS,
+    }
+    for field in fields(defaults):
+        key = field.name
+        default = getattr(defaults, key)
+        if isinstance(default, bool):
+            value = _stored_bool(values, key, default)
+        elif key in bounds:
+            value = _stored_int(values, key, default, *bounds[key])
+        else:
+            value = raw.get(key, default)
+            if value not in choices.get(key, ()):
+                value = default
+        setattr(result, key, value)
+    return result
+
+
+@dataclass(frozen=True)
+class ConversionPreset:
+    targets: tuple[str, ...]
+    settings: ConversionSettings
+
+    def compatible_targets(self, extension: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        from cove_converter.routing import targets_for
+        supported = targets_for(extension)
+        return (tuple(t for t in self.targets if t in supported),
+                tuple(t for t in self.targets if t not in supported))
+
+
+class PresetStore:
+    """Small versioned JSON value in existing QSettings; legacy keys untouched."""
+    MAX_COUNT = 32
+
+    @staticmethod
+    def _targets(raw) -> tuple[str, ...]:
+        from cove_converter.routing import SUPPORTED_FORMATS
+        known = {t for info in SUPPORTED_FORMATS.values() for t in info.targets}
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        return tuple(dict.fromkeys(t for t in raw[:64] if isinstance(t, str) and t in known))
+
+    def load(self) -> dict[str, ConversionPreset]:
+        raw = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value("presets/data", "")
+        if not isinstance(raw, str) or len(raw) > 256_000:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (ValueError, RecursionError):
+            return {}
+        if not isinstance(data, dict) or data.get("version") != 1:
+            return {}
+        entries = data.get("presets")
+        if not isinstance(entries, list):
+            return {}
+        result = {}
+        for entry in entries[:self.MAX_COUNT]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                name = _preset_name(entry.get("name"))
+            except ValueError:
+                continue
+            targets = self._targets(entry.get("targets"))
+            quality = entry.get("quality", {})
+            if targets and isinstance(quality, dict):
+                result[name] = ConversionPreset(targets, _preset_quality(quality))
+        return result
+
+    def _write(self, presets):
+        qs = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        qs.setValue("presets/data", json.dumps({"version": 1, "presets": [
+            {"name": name, "targets": list(preset.targets), "quality": asdict(preset.settings)}
+            for name, preset in presets.items()
+        ]}))
+        qs.sync()
+        if qs.status() != type(qs).Status.NoError:
+            raise ValueError("Could not persist conversion presets")
+
+    def save(self, name: str, targets: tuple[str, ...], quality: ConversionSettings):
+        name = _preset_name(name)
+        normalized = self._targets(targets)
+        if not normalized or tuple(dict.fromkeys(targets)) != normalized:
+            raise ValueError("Choose supported output formats for the preset")
+        presets = self.load()
+        if name not in presets and len(presets) >= self.MAX_COUNT:
+            raise ValueError("At most 32 presets can be saved")
+        presets[name] = ConversionPreset(normalized, _preset_quality(asdict(quality)))
+        self._write(presets)
+
+    def delete(self, name: str):
+        presets = self.load()
+        presets.pop(name, None)
+        self._write(presets)

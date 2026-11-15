@@ -7,6 +7,7 @@ from cove_converter.engines.pdf import PdfWorker
 from cove_converter.engines.pillow import PillowWorker
 from cove_converter.engines.spreadsheets import SpreadsheetWorker
 from cove_converter.engines.subtitles import SubtitleWorker
+from cove_converter.engines.svg import SvgWorker
 
 WORKER_REGISTRY: dict[str, type[BaseConverterWorker]] = {
     "FFmpeg":      FFmpegWorker,
@@ -17,6 +18,7 @@ WORKER_REGISTRY: dict[str, type[BaseConverterWorker]] = {
     "Spreadsheet": SpreadsheetWorker,
     "Archive":     ArchiveWorker,
     "Data":        DataWorker,
+    "Svg":         SvgWorker,
 }
 
 

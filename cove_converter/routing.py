@@ -78,6 +78,7 @@ SUPPORTED_FORMATS: dict[str, FormatInfo] = {
     )
     for extension in _IMAGE_INPUTS
 }
+SUPPORTED_FORMATS[".svg"] = FormatInfo("Svg", (".png", ".jpg", ".webp", ".pdf"))
 SUPPORTED_FORMATS.update(
     {
         extension: FormatInfo("FFmpeg", _VIDEO_TO_ANY)
@@ -193,6 +194,8 @@ def engine_for(ext_in: str, ext_out: str) -> str | None:
     info = info_for(ext_in)
     if info is None or ext_out.lower() not in info.targets:
         return None
+    if info.engine == "Svg":
+        return "Svg"
     if ext_in.lower() == ".pdf" or ext_out.lower() == ".pdf":
         return "Pdf"
     return info.engine
@@ -233,7 +236,7 @@ def effective_stem(path: Path) -> str:
 FORMAT_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Video", _VIDEO_INPUTS),
     ("Audio", _AUDIO_INPUTS),
-    ("Images", _IMAGE_INPUTS),
+    ("Images", (*_IMAGE_INPUTS, ".svg")),
     ("Documents", (".pdf", *_DOC_INPUTS)),
     ("Comics", _COMIC_FORMATS),
     ("Subtitles", _SUBTITLE_FORMATS),

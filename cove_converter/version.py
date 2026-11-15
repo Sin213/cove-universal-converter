@@ -7,7 +7,7 @@ import re
 import tomllib
 from pathlib import Path
 
-PROJECT_VERSION = "2.4.1"
+PROJECT_VERSION = "3.0.0"
 _VERSION_RE = re.compile(
     r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
     r"(?:[.-]?(?:a|b|rc|dev|post)\d*)?(?:\+[a-z0-9]+(?:[.-][a-z0-9]+)*)?$",

@@ -71,7 +71,7 @@ from cove_converter.routing import (
 )
 from cove_converter.settings import ConversionSettings, load_settings
 from cove_converter.ui.drop_zone import DropZone
-from cove_converter.ui.file_row import ConversionJob, FileRow, unique_path
+from cove_converter.ui.file_row import ConversionJob, FileRow, path_key, unique_path
 from cove_converter.ui.formats_dialog import FormatsDialog
 from cove_converter.ui.quality_dialog import QualityDialog
 from cove_converter.ui.theme import (
@@ -632,6 +632,8 @@ class MainWindow(QMainWindow):
         self._batch_failed = 0
         self._batch_skipped = 0
         self._batch_total = 0
+        self._batch_partial = 0
+        self._batch_cancelled = 0
         # Cancelled workers whose rows were removed. Held until their
         # QThread finishes - dropping the last reference to a live QThread
         # destroys it mid-run and crashes.
@@ -814,6 +816,16 @@ class MainWindow(QMainWindow):
         wrap_lay = QVBoxLayout(wrap)
         wrap_lay.setContentsMargins(0, 0, 0, 0)
         wrap_lay.setSpacing(0)
+
+        output_tools = QHBoxLayout()
+        self.outputs_summary = QLabel("Use + to select several outputs per file")
+        output_tools.addWidget(self.outputs_summary)
+        output_tools.addStretch(1)
+        presets_button = QPushButton("Outputs / Presets")
+        presets_button.setObjectName("btnGhost")
+        presets_button.clicked.connect(lambda: self._show_outputs_dialog())
+        output_tools.addWidget(presets_button)
+        wrap_lay.addLayout(output_tools)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["File", "Convert to", "Progress", "Status"])
@@ -1249,6 +1261,13 @@ class MainWindow(QMainWindow):
         wlay.setContentsMargins(8, 8, 8, 8)
         wlay.setSpacing(8)
         wlay.addWidget(target_combo)
+        outputs_button = QPushButton("+")
+        outputs_button.setObjectName("btnGhost")
+        outputs_button.setFixedWidth(34)
+        outputs_button.setStyleSheet("padding: 0px;")
+        outputs_button.setToolTip("Choose multiple output formats or a preset")
+        outputs_button.clicked.connect(lambda _=False, rr=row: self._show_outputs_dialog(rr))
+        wlay.addWidget(outputs_button)
         wlay.addWidget(enhance_check, stretch=1)
         self.table.setCellWidget(r, _COL_TARGET, wrap)
 
@@ -1265,6 +1284,7 @@ class MainWindow(QMainWindow):
             {
                 "file": file_cell,
                 "target": target_combo,
+                "outputs": outputs_button,
                 "enhance_pdf": enhance_check,
                 "progress": prog,
                 "status": status,
@@ -1315,6 +1335,8 @@ class MainWindow(QMainWindow):
         self._batch_skipped = 0
         self._batch_total = 0
         self.status_msg.setText("")
+        self._batch_partial = self._batch_cancelled = 0
+        self.outputs_summary.setText("Use + to select several outputs per file")
         self.convert_btn.setEnabled(True)
         self.open_file_btn.setVisible(False)
         self.show_folder_btn.setVisible(False)
@@ -1382,6 +1404,78 @@ class MainWindow(QMainWindow):
                 # would fall through to the wrong engine).
                 self._on_target_changed(row, ext)
 
+    def _set_row_targets(self, row: FileRow, targets: tuple[str, ...]) -> None:
+        if not targets or row in self._pending_rows or row in self._active_rows:
+            return
+        supported = targets_for(effective_suffix(row.path))
+        if any(target not in supported for target in targets):
+            raise ValueError("Unsupported output selection")
+        targets = tuple(dict.fromkeys(targets))
+        changed = row.selected_targets != targets
+        self._on_target_changed(row, targets[0])
+        row.extra_targets = targets[1:]
+        row.preset_settings = None
+        index = self._rows.index(row)
+        cells = self._row_widgets[index]
+        with QSignalBlocker(cells["target"]):
+            cells["target"].setCurrentText(targets[0])
+        if changed:
+            row.completed_output = None
+            row.completed_outputs.clear()
+            row.override_output = None
+            row.error_log = None
+            self._set_status(index, "Pending")
+            self._set_progress(index, 0)
+        if "outputs" in cells:
+            cells["outputs"].setText(f"+{len(targets) - 1}" if len(targets) > 1 else "+")
+            cells["outputs"].setToolTip("Outputs: " + ", ".join(targets))
+
+    def _apply_preset(self, preset, rows=None, *, formats_only=False) -> None:
+        label = "Formats" if formats_only else "Preset"
+        applied = skipped = busy = 0
+        for row in self._rows if rows is None else rows:
+            if row in self._pending_rows or row in self._active_rows:
+                busy += 1
+                continue
+            compatible, unsupported = preset.compatible_targets(effective_suffix(row.path))
+            skipped += len(unsupported)
+            if unsupported:
+                self._append_log("warn", f"{label} targets skipped: {row.path.name}", ", ".join(unsupported))
+            if compatible:
+                self._set_row_targets(row, compatible)
+                if not formats_only:
+                    row.preset_settings = replace(preset.settings)
+                row.completed_output = None
+                row.completed_outputs.clear()
+                row.error_log = None
+                index = self._rows.index(row)
+                self._set_status(index, "Pending")
+                self._set_progress(index, 0)
+                applied += 1
+        message = f"{label} applied to {applied} files; {skipped} unsupported targets skipped; {busy} busy files skipped"
+        self.status_msg.setText(message)
+        self._toast.show_message(message, "warn" if skipped or busy else "good")
+
+    def _show_outputs_dialog(self, row=None) -> None:
+        from cove_converter.ui.outputs_dialog import OutputsDialog
+        shared = targets_for(effective_suffix(row.path)) if row else common_targets(
+            effective_suffix(r.path) for r in self._rows
+        )
+        selected = row.selected_targets if row else shared[:1]
+        quality = (row.preset_settings or self._settings) if row else self._settings
+        dialog = OutputsDialog(shared, selected, quality, self)
+        if dialog.exec():
+            rows = self._rows if dialog.apply_all.isChecked() or row is None else [row]
+            if dialog.preset is not None:
+                self._apply_preset(dialog.preset, rows)
+            else:
+                from cove_converter.settings import ConversionPreset
+                self._apply_preset(
+                    ConversionPreset(dialog.selected_targets(), replace(dialog.quality)),
+                    rows, formats_only=True,
+                )
+        dialog.deleteLater()
+
     def _on_target_changed(self, row: FileRow, ext: str) -> None:
         """Hook fired whenever a row's target_ext changes (per-row combo or
         batch dropdown). Updates per-row state and toggles the Enhance-PDF
@@ -1400,17 +1494,23 @@ class MainWindow(QMainWindow):
                 with QSignalBlocker(target_combo):
                     target_combo.setCurrentText(row.target_ext)
             return
-        if ext != row.target_ext and row.status not in ("Pending", "Ready"):
+        if (ext != row.target_ext or row.extra_targets) and row.status not in ("Pending", "Ready"):
             # Terminal-state row (Done / Failed / Cancelled / Unsupported):
             # retargeting starts a fresh lifecycle, otherwise a Done row
             # can never be reconverted and its open/show actions keep
             # pointing at the old output.
             row.completed_output = None
+            row.completed_outputs.clear()
             row.override_output = None
             row.error_log = None
             self._set_status(index, "Pending")
             self._set_progress(index, 0)
         row.target_ext = ext
+        row.extra_targets = ()
+        row.preset_settings = None
+        if "outputs" in cells:
+            cells["outputs"].setText("+")
+            cells["outputs"].setToolTip("Choose multiple output formats or a preset")
         target_combo = cells.get("target")
         if target_combo is not None:
             target_combo.setToolTip(_target_tooltip(effective_suffix(row.path), ext))
@@ -1434,7 +1534,7 @@ class MainWindow(QMainWindow):
         if count == 1:
             row_idx = selected_rows[0]
             row = self._rows[row_idx] if 0 <= row_idx < len(self._rows) else None
-            if row is not None and row.status == "Done":
+            if row is not None and row.status in ("Done", "Partial"):
                 open_action = QAction("Open file", menu)
                 open_action.triggered.connect(lambda _=False, i=row_idx: self._open_row_file(i))
                 menu.addAction(open_action)
@@ -1443,8 +1543,14 @@ class MainWindow(QMainWindow):
                 show_action.triggered.connect(lambda _=False, i=row_idx: self._show_row_in_folder(i))
                 menu.addAction(show_action)
 
+                if len(row.completed_outputs) > 1:
+                    outputs_menu = menu.addMenu("Open output")
+                    for path in row.completed_outputs:
+                        action = outputs_menu.addAction(path.name)
+                        action.triggered.connect(lambda _=False, p=path: open_local(str(p)))
+
                 menu.addSeparator()
-            elif row is not None and (row.status.startswith("Failed") or row.status == "Unsupported"):
+            if row is not None and (row.status.startswith("Failed") or row.status in ("Unsupported", "Partial")):
                 view_log = QAction("View log", menu)
                 view_log.setEnabled(bool(row.error_log))
                 view_log.triggered.connect(lambda _=False, i=row_idx: self._view_row_log(i))
@@ -1517,47 +1623,81 @@ class MainWindow(QMainWindow):
         when the user elects to overwrite existing outputs. Renaming also
         avoids natural destinations belonging to later rows in this batch.
         """
+        expanded = []
+        for row, out in resolved:
+            for target in row.selected_targets:
+                destination = out if target == row.target_ext else replace(
+                    row, target_ext=target, override_output=None
+                ).resolve_output(self._output_dir)
+                expanded.append((row, destination, target))
         reserved = {r.path.resolve() for r in self._rows}
+        if self._batch_total:
+            reserved.update(p.resolve() for r in self._rows for p in r.completed_outputs)
         for r in (*self._pending_rows, *self._active_rows):
             if r.job is not None:
                 reserved.add(r.job.output_path.resolve())
+            reserved.update(job.output_path.resolve() for job in r.jobs)
         for worker in self._dead_workers:
             reserved.add(worker.input_path.resolve())
             reserved.add(worker._final_output_path.resolve())
-        natural = {out.resolve() for _, out in resolved}
-        planned: list[tuple[FileRow, Path]] = []
-        for row, out in resolved:
+        natural = {out.resolve() for _, out, _ in expanded}
+        planned = []
+        failed_rows = set()
+        for row, out, target in expanded:
             try:
-                if out.resolve() in reserved:
+                if path_key(out) in {path_key(p) for p in reserved}:
                     out = unique_path(out, reserved | natural)
+                elif out.parent.exists() and any(
+                    p.name != out.name and p.name.casefold() == out.name.casefold()
+                    for p in out.parent.iterdir()
+                ):
+                    out = unique_path(out, reserved | natural)
+            except OSError as exc:
+                self._record_preflight_failure(
+                    self._rows.index(row), "Failed: cannot inspect destination",
+                    f"Could not inspect output destination {out.parent}: {exc}",
+                )
+                failed_rows.add(row)
+                continue
             except RuntimeError as exc:
                 self._record_preflight_failure(
                     self._rows.index(row), "Failed: no free output name", str(exc)
                 )
+                failed_rows.add(row)
                 continue
             reserved.add(out.resolve())
-            planned.append((row, out))
+            planned.append((row, out, target))
 
-        conflicts = [(row, out) for row, out in planned
+        conflicts = [(row, out) for row, out, _ in planned
                      if out.exists() or out.is_symlink()]
         choice = self._ask_overwrite(conflicts) if conflicts else "overwrite"
         if choice == "cancel":
             return None
 
         ready: list[FileRow] = []
-        for row, out in planned:
+        jobs = {}
+        for row, out, target in planned:
+            if row in failed_rows:
+                continue
             if choice == "rename" and (out.exists() or out.is_symlink()):
                 try:
                     out = unique_path(out, reserved | natural)
+                except OSError as exc:
+                    self._record_preflight_failure(
+                        self._rows.index(row), "Failed: cannot inspect destination",
+                        f"Could not inspect output destination {out.parent}: {exc}",
+                    )
+                    failed_rows.add(row)
+                    continue
                 except RuntimeError as exc:
                     self._record_preflight_failure(
                         self._rows.index(row), "Failed: no free output name", str(exc)
                     )
+                    failed_rows.add(row)
                     continue
                 reserved.add(out.resolve())
-            engine = engine_for(effective_suffix(row.path), row.target_ext)
+            engine = engine_for(effective_suffix(row.path), target)
             assert engine is not None  # callers validated the route
-            row.override_output = out
             # Resolve only the parent directory of each path so a later-
             # retargeted parent symlink can't move where the worker reads or
             # writes (the original collision-safety gap), while the leaf
@@ -1567,10 +1707,19 @@ class MainWindow(QMainWindow):
             # returning/using literal ones.
             frozen_input = row.path.parent.resolve() / row.path.name
             frozen_output = out.parent.resolve() / out.name
-            row.job = ConversionJob(
-                frozen_input, frozen_output, row.target_ext, engine,
-                replace(self._settings, enhance_scanned_pdf=row.enhance_pdf),
-            )
+            jobs.setdefault(row, []).append(ConversionJob(
+                frozen_input, frozen_output, target, engine,
+                replace(row.preset_settings or self._settings, enhance_scanned_pdf=row.enhance_pdf),
+            ))
+        for row, row_jobs in jobs.items():
+            if row in failed_rows:
+                continue
+            row.jobs = tuple(row_jobs)
+            row.job_index = 0
+            row.job = row.jobs[0]
+            row.override_output = row.job.output_path
+            row.completed_outputs.clear()
+            row.target_errors.clear()
             ready.append(row)
         return ready
 
@@ -1597,12 +1746,12 @@ class MainWindow(QMainWindow):
             # override from an earlier run would silently retarget the old
             # "(1)" path even after the collision is gone.
             row.override_output = None
-            if engine_for(effective_suffix(row.path), row.target_ext) is None:
+            if any(engine_for(effective_suffix(row.path), t) is None for t in row.selected_targets):
                 self._record_preflight_failure(
                     i,
                     "Unsupported",
                     f"Unsupported: no engine available to convert "
-                    f"{effective_suffix(row.path)} → {row.target_ext}",
+                    f"{effective_suffix(row.path)} → {', '.join(row.selected_targets)}",
                 )
                 pre_skipped += 1
                 continue
@@ -1642,6 +1791,7 @@ class MainWindow(QMainWindow):
             self._batch_done = 0
             self._batch_failed = pre_failed
             self._batch_skipped = pre_skipped
+            self._batch_partial = self._batch_cancelled = 0
         else:
             self._batch_failed += pre_failed
             self._batch_skipped += pre_skipped
@@ -1675,12 +1825,12 @@ class MainWindow(QMainWindow):
         # Fresh attempt: recompute the natural output (see _convert_all).
         row.override_output = None
 
-        if engine_for(effective_suffix(row.path), row.target_ext) is None:
+        if any(engine_for(effective_suffix(row.path), t) is None for t in row.selected_targets):
             self._record_preflight_failure(
                 index,
                 "Unsupported",
                 f"Unsupported: no engine available to convert "
-                f"{effective_suffix(row.path)} → {row.target_ext}",
+                f"{effective_suffix(row.path)} → {', '.join(row.selected_targets)}",
             )
             return
 
@@ -1704,6 +1854,7 @@ class MainWindow(QMainWindow):
             self._batch_done = 0
             self._batch_failed = 0
             self._batch_skipped = 0
+            self._batch_partial = self._batch_cancelled = 0
         self._batch_total += 1
         self._set_status(index, "Queued")
         self.status_msg.setText("Converting…")
@@ -1749,8 +1900,10 @@ class MainWindow(QMainWindow):
         # Drop any prior failure log unconditionally before this attempt's
         # outcome is decided — covers both the engine-missing branch below
         # and the worker-creation path that follows.
-        row.error_log = None
-        row.completed_output = None
+        if row.job_index == 0:
+            row.error_log = None
+            row.completed_output = None
+        row.target_status = "Processing"
         job = row.job
         if job is None:
             self._record_preflight_failure(
@@ -1772,6 +1925,7 @@ class MainWindow(QMainWindow):
 
         worker_cls = worker_for(job.engine)
         worker = worker_cls(job.input_path, job.output_path, replace(job.settings))
+        worker.setParent(self)
         row.worker = worker
 
         # Capture the row, not its index — Clear Failed during an in-flight
@@ -1782,7 +1936,7 @@ class MainWindow(QMainWindow):
         # finish time would go stale if the target or output dir changed
         # while the conversion ran.
         worker.finished_ok.connect(
-            lambda p, rr=row: setattr(rr, "completed_output", Path(p))
+            lambda p, rr=row: self._record_output(rr, Path(p))
         )
         worker.failed.connect(
             lambda msg, tb, rr=row: self._on_worker_failed(rr, msg, tb)
@@ -1791,19 +1945,28 @@ class MainWindow(QMainWindow):
         self._active_rows.add(row)
         worker.start()
 
+    def _record_output(self, row: FileRow, path: Path) -> None:
+        row.completed_output = path
+        row.completed_outputs.append(path)
+        if row in self._rows:
+            names = "\n".join(str(p) for p in row.completed_outputs)
+            self._row_widgets[self._rows.index(row)]["status"].chip.setToolTip(names)
+
     def _on_worker_progress(self, row: FileRow, pct: int) -> None:
         try:
             index = self._rows.index(row)
         except ValueError:
             return
-        self._set_progress(index, pct)
+        count = max(1, len(row.jobs))
+        self._set_progress(index, (row.job_index * 100 + pct) // count)
 
     def _on_worker_status(self, row: FileRow, text: str) -> None:
         try:
             index = self._rows.index(row)
         except ValueError:
             return
-        self._set_status(index, text)
+        row.target_status = text
+        self._set_status(index, "Processing" if len(row.jobs) > 1 else text)
 
     def _on_worker_failed(self, row: FileRow, message: str, tb: str) -> None:
         # Persist the worker's exception message + traceback on the row
@@ -1816,6 +1979,9 @@ class MainWindow(QMainWindow):
             row.error_log = f"{msg}\n\n{tb_text}\n"
         else:
             row.error_log = f"{msg}\n"
+        if len(row.jobs) > 1:
+            row.target_errors.append(f"{row.job.target_ext}: {row.error_log}")
+            row.error_log = "\n".join(row.target_errors)
         self._append_log("error", f"Failed {row.path.name}", msg)
 
     def _record_preflight_failure(
@@ -1836,6 +2002,24 @@ class MainWindow(QMainWindow):
 
     def _on_worker_finished(self, row: FileRow) -> None:
         self._active_rows.discard(row)
+        if row in self._rows and len(row.jobs) > 1:
+            cancelled = row.target_status == "Cancelled" or row.worker._cancel
+            if not cancelled and row.job_index + 1 < len(row.jobs):
+                previous = row.worker
+                previous.wait()
+                row.job_index += 1
+                row.job = row.jobs[row.job_index]
+                self._start_row(row)
+                previous.deleteLater()
+                return
+            if row.completed_outputs:
+                status = "Partial" if cancelled or row.target_errors else "Done"
+            else:
+                status = "Cancelled" if cancelled else row.target_status
+            if cancelled and row.completed_outputs:
+                row.target_errors.append("Remaining outputs cancelled")
+            row.error_log = "\n".join(row.target_errors) or None
+            self._set_status(self._rows.index(row), status)
         # Row may have been removed (e.g. via Clear All) before the worker
         # finished emitting; in that case skip the per-row accounting but
         # still pump the queue so the next conversion can start.
@@ -1859,6 +2043,10 @@ class MainWindow(QMainWindow):
                 )
             elif status.startswith("Failed"):
                 self._batch_failed += 1
+            elif status == "Partial":
+                self._batch_partial += 1
+            elif status == "Cancelled":
+                self._batch_cancelled += 1
         self._pump_queue()
 
     def _announce_batch_done(self) -> None:
@@ -1866,7 +2054,9 @@ class MainWindow(QMainWindow):
         done = self._batch_done
         failed = self._batch_failed
         skipped = self._batch_skipped
-        if failed or skipped:
+        partial = self._batch_partial
+        cancelled = self._batch_cancelled
+        if failed or skipped or partial or cancelled:
             parts = [f"✓ {done} of {total} done"]
             toast_parts = [f"{done} done"]
             if failed:
@@ -1875,16 +2065,27 @@ class MainWindow(QMainWindow):
             if skipped:
                 parts.append(f"⤼ {skipped} skipped")
                 toast_parts.append(f"{skipped} skipped")
+            if partial:
+                parts.append(f"{partial} partial")
+                toast_parts.append(f"{partial} partial")
+            if cancelled:
+                parts.append(f"{cancelled} cancelled")
+                toast_parts.append(f"{cancelled} cancelled")
             msg = " · ".join(parts)
             self._toast.show_message(" · ".join(toast_parts), "warn")
         else:
             msg = f"✓ All {total} conversions complete"
             self._toast.show_message(msg)
         self.status_msg.setText(msg)
+        self.status_msg.setToolTip(msg)
+        output_count = sum(len(r.completed_outputs) for r in self._rows
+                           if r.status in ("Done", "Partial"))
+        self.outputs_summary.setText(f"{msg} · {output_count} outputs available")
         # Only clear if the message is still ours - batch A's timer must
         # not wipe batch B's newer summary.
         QTimer.singleShot(
             8000,
+            self,
             lambda m=msg: (
                 self.status_msg.setText("")
                 if self.status_msg.text() == m else None
@@ -1895,14 +2096,14 @@ class MainWindow(QMainWindow):
         self._batch_skipped = 0
         # Reveal the open-file / show-folder buttons if at least one
         # conversion succeeded.
-        if done > 0 and self._last_output_file() is not None:
+        if (done > 0 or partial > 0) and self._last_output_file() is not None:
             self.open_file_btn.setVisible(True)
             self.show_folder_btn.setVisible(True)
 
     def _last_output_file(self) -> Path | None:
         """Path of the most recently completed conversion's output, or None."""
         for row in reversed(self._rows):
-            if row.status == "Done":
+            if row.status in ("Done", "Partial"):
                 return row.completed_output or row.resolve_output(self._output_dir)
         return None
 
@@ -2005,7 +2206,7 @@ class MainWindow(QMainWindow):
         if not (0 <= index < len(self._row_widgets)):
             return
         cells = self._row_widgets[index]
-        for name in ("target", "enhance_pdf"):
+        for name in ("target", "enhance_pdf", "outputs"):
             widget = cells.get(name)
             if widget is not None:
                 widget.setEnabled(text not in ("Queued", "Processing"))
@@ -2016,6 +2217,9 @@ class MainWindow(QMainWindow):
             cells["status"].set_state("processing")
         elif text == "Queued":
             cells["status"].set_state("queued")
+        elif text == "Partial":
+            cells["status"].set_state("failed", label="Partial")
+            cells["progress"].set_progress(self._rows[index].progress, state="failed")
         elif text.startswith("Failed") or text == "Unsupported":
             cells["status"].set_state("failed", label="Failed" if text.startswith("Failed") else "Unsupported")
             cells["progress"].set_progress(self._rows[index].progress, state="failed")

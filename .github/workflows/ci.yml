@@ -58,4 +58,4 @@ jobs:
         if: matrix.python == '3.12'
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python scripts/smoke_conversions.py --quiet --input .ndjson --input .srt --input .cbz
+        run: python scripts/smoke_conversions.py --quiet --input .ndjson --input .srt --input .cbz --input .svg

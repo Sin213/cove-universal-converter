@@ -76,6 +76,7 @@ ENGINE_DEPS: dict[str, list[Callable[[], str | None]]] = {
     "Spreadsheet": [lambda: _probe_module("openpyxl")],
     "Archive": [],
     "Data": [lambda: _probe_module("yaml")],
+    "Svg": [lambda: _probe_module("svglib"), lambda: _probe_module("pypdfium2")],
 }
 
 # Per-extension extra requirements (HEIC needs pillow-heif, etc.).
@@ -104,6 +105,14 @@ def missing_dependencies(engine: str, in_ext: str, out_ext: str) -> list[str]:
 # Each generator writes a single tiny valid file at ``dest`` and returns the
 # same path. Generators are gated on what optional libs / binaries exist; if
 # generation fails the route gets SKIPPED with the reason.
+
+
+def _gen_svg(dest: Path) -> Path:
+    dest.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24">'
+        '<rect width="16" height="12" fill="red"/></svg>', encoding="utf-8",
+    )
+    return dest
 
 
 def _gen_txt(dest: Path) -> Path:
@@ -607,6 +616,7 @@ _VIDEO_EXTENSIONS = (
 )
 
 SAMPLE_GENERATORS: dict[str, Callable[[Path], Path]] = {
+    ".svg": _gen_svg,
     # docs / text
     ".txt": _gen_txt,
     ".md": _gen_md,
