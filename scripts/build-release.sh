@@ -48,10 +48,10 @@ PANDOC_VERSION="3.1.13"
 # https://github.com/BtbN/FFmpeg-Builds/releases, download the
 # linux64-gpl asset, run ``sha256sum`` on it, and update the URL + hash.
 _FFMPEG_DEFAULT_VERSION="7.1.4"
-_FFMPEG_DEFAULT_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-04-14-00/ffmpeg-n7.1.4-9-gc06af95f12-linux64-gpl-7.1.tar.xz"
+_FFMPEG_DEFAULT_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-05-31-13-22/ffmpeg-n7.1.4-7-gadcf20da26-linux64-gpl-7.1.tar.xz"
 FFMPEG_VERSION="${FFMPEG_VERSION:-$_FFMPEG_DEFAULT_VERSION}"
 FFMPEG_URL="${FFMPEG_URL:-$_FFMPEG_DEFAULT_URL}"
-FFMPEG_SHA256="${FFMPEG_SHA256:-a7ffb6b18ebd414a7992777eb68dae6580c8ca7d2329a1c308e466eaf98ff989}"
+FFMPEG_SHA256="${FFMPEG_SHA256:-ce46c711e3ff79ae1e9318bf7daa54c77f41ce37b71010c44f4a0b38f1d7a29f}"
 # An FFMPEG_VERSION override without a matching URL+hash would log one
 # version while downloading and hash-verifying another.
 if [ "$FFMPEG_VERSION" != "$_FFMPEG_DEFAULT_VERSION" ] && [ "$FFMPEG_URL" = "$_FFMPEG_DEFAULT_URL" ]; then
